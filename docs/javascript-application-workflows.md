@@ -95,6 +95,14 @@ matches exactly. Otherwise the result recommends provider-neutral follow-up
 tools and reports `requires-provider-analysis`; it never starts or switches a
 provider implicitly.
 
+A handoff requires the add-on's exact content identity. Unavailable unpacked
+companions remain visible in the trace graph with their canonical path,
+availability and container-backed Evidence. They yield no actionable handoff
+until their bytes are available and the application is reanalyzed; the archive
+digest does not identify the missing add-on. An empty handoff list does not prove
+that the trace contains no native components. Source partial coverage remains
+visible independently of handoff eligibility.
+
 ## Semantic relation tracing
 
 `trace_javascript_semantics` queries the authenticated companion graph without
@@ -116,6 +124,17 @@ registrations/removals and dispatch, Node timers and cancellation handles, async
 `node:child_process` creation and ownership, configuration sources and direct
 defaults, request construction and response consumers, parse/coercion/
 validation boundaries, and built-in resource acquisition/release.
+
+Local callback candidates do not establish a complete target set when a
+conditional write may leave a parameter, catch binding, or uninitialized
+variable unchanged. These calls retain candidate edges and dynamic uncertainty;
+default traces remain ambiguous with partial coverage. Opt into
+`include_ambiguous_dynamic_edges` to traverse the candidates. Proven preceding
+unconditional assignments, including writes dominating a read in the same
+conditional block, can resolve a target; later writes do not replace an
+earlier read or captured alias. Unproved ordering across branches or function
+activations remains conservative. Returned-reference effects use the same
+read-position facts as call resolution.
 
 Mutation tracking covers explicit member assignments, updates, deletion, and
 loop assignment targets, including the supported local aliases and shared
@@ -166,8 +185,13 @@ graph and read literal values from `properties.value`, rather than decoding
 role keys or labels. Previously stored graphs and their original IDs remain
 valid inputs.
 
-Endpoint nodes keep the exact endpoint in each observation's `properties.value`;
-semantic request and response nodes keep it in `properties.endpoint`. Endpoint
+Endpoint observations keep their value in `properties.value`. When
+`properties.resolution` is `partial`, that value is the unresolved source
+expression, with an identity distinct from an exact endpoint of the same text.
+Semantic request and response nodes keep their endpoint in `properties.endpoint`. Endpoint
+lookup identities are preserved independently of the primitive-value lattice's
+byte budget. An oversized normalized literal can become unknown while the same
+string remains an exact endpoint for tracing and comparison. Endpoint
 identity keys use `value-sha256:<digest>` over the canonical JSON string when
 that is shorter, or when the original value starts with the reserved digest
 prefix. Other short endpoint keys remain unchanged. Endpoint labels use the
@@ -248,6 +272,13 @@ Direct return expressions, including expression-bodied arrows, are evaluated
 through an execution-free value lattice. Literal object fields and direct
 return sites are represented in the result. Calls, dynamic spreads, computed
 keys, and parser recovery remain partial or unknown.
+Rebound values are evaluated at their read position: saving an incoming parameter
+before a later assignment preserves caller-dependent uncertainty, while a proven
+preceding assignment can supply a constant. Unresolved ordering remains unknown.
+Supported reads within object and array literals follow left-to-right evaluation;
+an unproved relative order remains unknown. A later write in a separate conditional
+block can still leave an earlier capture unknown because ordering across those
+blocks is not proven.
 Objects and arrays passed to calls, constructors, or tagged templates, used
 as method receivers, or stored through property targets are not assumed
 unchanged afterward. Property stores conservatively retain reference escape

@@ -41,6 +41,11 @@ import {
 } from "../process/ProviderDeadline.js";
 import { redactCapturedTransportCredential } from "../process/ProviderDiagnosticRedaction.js";
 import { ProviderRunLineage } from "../process/ProviderRunLineage.js";
+import { ABORTED, waitForAbortable } from "../process/AbortablePromise.js";
+import {
+  SharedStartupAttempt,
+  STARTUP_OWNER_CLOSED,
+} from "../process/SharedStartupAttempt.js";
 import {
   type ProviderProcessDiagnostic,
   ProviderProcessSupervisor,
@@ -91,6 +96,9 @@ export interface HopperClientOptions {
   readonly logger?: Logger;
 }
 
+type HopperStartupResult = Result<HopperServerInfo, AnalysisError>;
+type HopperStartupAttempt = SharedStartupAttempt<HopperStartupResult>;
+
 type HopperClientCloseOptions = {
   readonly progress?: ProgressReporter;
   readonly retainDocument?: boolean;
@@ -125,11 +133,9 @@ export class HopperClient {
   #launcherExitCode: number | null | undefined;
   #launcherFailureDiagnostic: HopperStartupFailureDiagnostic | undefined;
   #operationFailure: OperationFailureRecord | undefined;
-  #startupController: AbortController | undefined;
-  #ready = false;
   #startupFailureResult: AnalysisError | undefined;
   #runId: string | undefined;
-  #startPromise: Promise<Result<HopperServerInfo, AnalysisError>> | undefined;
+  #startupAttempt: HopperStartupAttempt | undefined;
   #closePromise: Promise<Result<null, AnalysisError>> | undefined;
   readonly #onSocketData = (chunk: string): void => {
     this.#responses.push(chunk);
@@ -142,7 +148,12 @@ export class HopperClient {
     this.#rememberProcessFailure(error, []);
   };
   readonly #onSocketClose = (): void => {
-    if (this.#closing) return;
+    if (this.#closing) {
+      this.#failAll(
+        new HopperProcessError(null, { providerState: "unreachable" }),
+      );
+      return;
+    }
     const launch = this.#resources.launch;
     if (
       launch?.providerLifetime === "launcher-process" &&
@@ -215,6 +226,24 @@ export class HopperClient {
    * A recorded exit remains visible after request activity returns to idle.
    */
   operationHealth(): ProviderOperationHealth {
+    if (
+      this.#closing ||
+      this.#closePromise !== undefined ||
+      (!this.#startupSucceeded() &&
+        this.#startupAttempt !== undefined &&
+        this.#operationFailure === undefined)
+    ) {
+      return {
+        state: "busy",
+        stage:
+          this.#closing || this.#closePromise !== undefined
+            ? "connection"
+            : "launch",
+        retryAction: "wait",
+        exitCode: null,
+        requests: [],
+      };
+    }
     const failure = this.#operationFailure;
     if (failure !== undefined) {
       const requests: readonly ProviderOperationRequest[] =
@@ -263,63 +292,81 @@ export class HopperClient {
     };
   }
 
+  /** Read completion from the current attempt; no independent readiness flag. */
+  #startupSucceeded(): boolean {
+    const startup = this.#startupAttempt?.settlement;
+    return startup?.status === "completed" && startup.value.ok;
+  }
+
   /** True only after the authenticated health handshake has completed. */
   isReady(): boolean {
     return (
-      this.#ready &&
+      this.#startupSucceeded() &&
       this.#socket !== undefined &&
       !this.#socket.destroyed &&
+      !this.#closing &&
       this.#closePromise === undefined
     );
   }
 
-  /** Launch the bridge once and complete its authenticated health handshake. */
-  start(
-    signal?: AbortSignal,
-  ): Promise<Result<HopperServerInfo, AnalysisError>> {
-    if (this.#closePromise !== undefined) {
-      return this.#closePromise.then((closed) =>
-        closed.ok ? this.start(signal) : closed,
+  /** Launch the bridge once while each caller retains its own cancellation. */
+  start(signal?: AbortSignal): Promise<HopperStartupResult> {
+    if (isAborted(signal))
+      return Promise.resolve(err(new HopperCancelledError()));
+    if (this.#closePromise !== undefined)
+      return waitForAbortable(this.#closePromise, signal).then((closed) =>
+        closed === ABORTED
+          ? err(new HopperCancelledError())
+          : closed.ok
+            ? this.start(signal)
+            : closed,
       );
-    }
-    if (this.#startPromise !== undefined) return this.#startPromise;
-
-    const controller = new AbortController();
-    const onAbort = (): void => controller.abort(signal?.reason);
-    if (signal?.aborted === true) onAbort();
-    else signal?.addEventListener("abort", onAbort, { once: true });
-    const started = this.#start(controller.signal);
-    this.#startupController = controller;
-    this.#startPromise = started;
-    const release = (): void => {
-      signal?.removeEventListener("abort", onAbort);
-    };
-    const reset = (): void => {
-      if (this.#startPromise === started) {
-        this.#startPromise = undefined;
-        if (this.#startupController === controller) {
-          this.#startupController = undefined;
-        }
-      }
-    };
-    void started.then(
+    const current = this.#startupAttempt;
+    if (current !== undefined)
+      return current.signal.aborted
+        ? this.#retryAfterAbortedStartup(current, signal)
+        : this.#waitForStartup(current, signal);
+    const attempt = new SharedStartupAttempt((signal) => this.#start(signal));
+    this.#startupAttempt = attempt;
+    void attempt.promise.then(
       (result) => {
-        release();
         if (!result.ok) {
           this.#rememberStartupFailure(result.error);
-          reset();
-        } else this.#ready = true;
+          if (this.#startupAttempt === attempt)
+            this.#startupAttempt = undefined;
+        }
       },
       (cause: unknown) => {
         this.#logger.debug(
           { error: cause instanceof Error ? cause.message : String(cause) },
           "Hopper startup promise rejected during bookkeeping",
         );
-        release();
-        reset();
+        if (this.#startupAttempt === attempt) this.#startupAttempt = undefined;
       },
     );
-    return started;
+    return this.#waitForStartup(attempt, signal);
+  }
+
+  async #waitForStartup(
+    attempt: HopperStartupAttempt,
+    signal?: AbortSignal,
+  ): Promise<HopperStartupResult> {
+    const waited = await attempt.wait(signal);
+    if (waited.status === "completed") return waited.value;
+    if (waited.status === "stopped" && !waited.value.ok) return waited.value;
+    return err(new HopperCancelledError());
+  }
+
+  /** Cleanup belongs to the abandoned attempt, never to a prospective retry. */
+  async #retryAfterAbortedStartup(
+    attempt: HopperStartupAttempt,
+    signal?: AbortSignal,
+  ): Promise<HopperStartupResult> {
+    const waited = await waitForAbortable(attempt.promise, signal);
+    if (waited === ABORTED || (waited.ok && isAborted(signal)))
+      return err(new HopperCancelledError());
+    if (waited.ok || waited.error.cleanupIncomplete) return waited;
+    return this.start(signal);
   }
 
   async #start(
@@ -340,12 +387,16 @@ export class HopperClient {
     this.#operationFailure = undefined;
     this.#startupFailureResult = undefined;
     this.#resources.shutdownConfirmed = false;
+    this.#resources.externalApplication = undefined;
     const deadline = new ProviderStartupDeadline(
       this.#options.startupTimeoutMs,
       signal,
     );
     try {
-      return await this.#startWithin(deadline);
+      const result = await this.#startWithin(deadline);
+      return result.ok && deadline.signal.aborted
+        ? this.#startupFailure(await this.#startupInterruption(deadline))
+        : result;
     } finally {
       deadline.dispose();
     }
@@ -437,9 +488,41 @@ export class HopperClient {
           : health.error,
       );
     }
-    const parsed = parseHopperServerInfo(health.value, runId);
+    const parsed = await this.#authenticateServerInfo(health.value, runId);
     if (!parsed.ok) return this.#startupFailure(parsed.error);
+    try {
+      await this.#lineage.observe(this.#resources.launch);
+    } catch (cause: unknown) {
+      return this.#startupFailure(
+        deadline.signal.aborted
+          ? await this.#startupInterruption(deadline)
+          : new HopperStartError({ cause }),
+      );
+    }
+    if (deadline.signal.aborted)
+      return this.#startupFailure(await this.#startupInterruption(deadline));
+    return parsed;
+  }
+
+  /** Bind process identity for both initial and late cleanup handshakes. */
+  async #authenticateServerInfo(
+    value: JsonValue,
+    runId: string,
+  ): Promise<Result<HopperServerInfo, HopperProtocolError>> {
+    const parsed = parseHopperServerInfo(value, runId);
+    if (!parsed.ok) return parsed;
     if (this.#resources.launch?.providerLifetime === "external-application") {
+      const application = this.#resources.externalApplication;
+      if (
+        application !== undefined &&
+        application.pid !== parsed.value.processId
+      )
+        return err(
+          new HopperProtocolError(
+            "Hopper bridge process changed within the same run",
+          ),
+        );
+      if (application?.identity.state === "readable") return parsed;
       let identity;
       try {
         identity = await observeProcessStartIdentity(parsed.value.processId);
@@ -460,7 +543,6 @@ export class HopperClient {
         },
       };
     }
-    await this.#lineage.observe(this.#resources.launch);
     return parsed;
   }
 
@@ -543,24 +625,22 @@ export class HopperClient {
   close(
     options: HopperClientCloseOptions = {},
   ): Promise<Result<null, AnalysisError>> {
-    const starting = this.#startPromise;
-    const controller = this.#startupController;
-    controller?.abort();
+    const starting = this.#startupAttempt;
+    starting?.close();
     this.#closePromise ??= Promise.resolve().then(() =>
-      this.#close(starting, controller, options),
+      this.#close(starting, options),
     );
     return this.#closePromise;
   }
 
   async #close(
-    starting: Promise<Result<HopperServerInfo, AnalysisError>> | undefined,
-    controller: AbortController | undefined,
+    starting: HopperStartupAttempt | undefined,
     options: HopperClientCloseOptions,
   ): Promise<Result<null, AnalysisError>> {
     try {
       // best-effort cleanup: a rejected startup must not mask close/cleanup;
       // #cleanup reports the authoritative close result.
-      await starting?.catch(() => undefined);
+      await starting?.promise.catch(() => undefined);
       await confirmExternalApplicationExit(this.#resources, this.#socket, () =>
         this.#releaseTransport(),
       );
@@ -569,10 +649,7 @@ export class HopperClient {
       if (closed.ok) this.#startupFailureResult = undefined;
       return closed;
     } finally {
-      if (this.#startPromise === starting) this.#startPromise = undefined;
-      if (this.#startupController === controller) {
-        this.#startupController = undefined;
-      }
+      if (this.#startupAttempt === starting) this.#startupAttempt = undefined;
       this.#closePromise = undefined;
     }
   }
@@ -631,7 +708,11 @@ export class HopperClient {
           timeoutMs: HOPPER_SHUTDOWN_TIMEOUT_MS,
         },
       );
-      if (health.ok && parseHopperServerInfo(health.value, runId).ok) return;
+      if (
+        health.ok &&
+        (await this.#authenticateServerInfo(health.value, runId)).ok
+      )
+        return;
       this.#releaseTransport();
     } finally {
       this.#closing = false;
@@ -643,7 +724,6 @@ export class HopperClient {
     options: HopperClientCloseOptions = {},
   ): Promise<Result<null, AnalysisError>> {
     this.#closing = true;
-    this.#ready = false;
     try {
       const closed = await cleanupHopperSession({
         socket: this.#socket,
@@ -743,7 +823,9 @@ export class HopperClient {
 
   async #startupInterruption(
     deadline: ProviderStartupDeadline,
-  ): Promise<HopperCancelledError | HopperTimeoutError> {
+  ): Promise<HopperCancelledError | HopperTimeoutError | HopperProtocolError> {
+    if (deadline.signal.reason === STARTUP_OWNER_CLOSED)
+      return new HopperProtocolError("Hopper session closed during startup");
     if (deadline.interruption === "cancelled")
       return new HopperCancelledError();
     return new HopperTimeoutError(

@@ -8,7 +8,11 @@ import { traverseJavaScriptAst } from "./javascript/javascriptSemanticTraversal.
 import { indexJavaScriptBindingsWithReceiversSteps } from "./javascript/javascriptSemanticAnalysis.js";
 import { completeSemanticSteps } from "./javascript/javascriptSemanticTraversal.js";
 import type { JavaScriptOpenReceiverFact } from "./javascript/javascriptSemanticAnalysis.js";
-import { semanticStaticPropertyName } from "./javascript/javascriptAstValues.js";
+import {
+  semanticStaticPropertyKey,
+  semanticStaticPropertyName,
+  unwrapJavaScriptExpression,
+} from "./javascript/javascriptAstValues.js";
 import {
   calleeName,
   endpointArgument,
@@ -205,11 +209,29 @@ const inspectCall = (
       node,
       accumulator,
     });
-  if (
-    name.endsWith("modelContext.registerTool") ||
-    name === "modelContext.registerTool"
-  )
+  if (isWebMcpRegistrationCallee(node.callee))
     addWebMcpDeclaration(script, node, accumulator);
+};
+
+/** Match exact WebMCP receiver and method properties without flattening keys. */
+const isWebMcpRegistrationCallee = (callee: t.Node): boolean => {
+  const method = unwrapJavaScriptExpression(callee).node;
+  if (!t.isMemberExpression(method) && !t.isOptionalMemberExpression(method))
+    return false;
+  if (
+    semanticStaticPropertyKey(method.property, method.computed) !==
+    "registerTool"
+  )
+    return false;
+
+  const receiver = unwrapJavaScriptExpression(method.object).node;
+  if (t.isIdentifier(receiver, { name: "modelContext" })) return true;
+  return (
+    (t.isMemberExpression(receiver) ||
+      t.isOptionalMemberExpression(receiver)) &&
+    semanticStaticPropertyKey(receiver.property, receiver.computed) ===
+      "modelContext"
+  );
 };
 
 const inspectRouteProperty = (
@@ -315,20 +337,15 @@ const addWebMcpDeclaration = (
   const schema =
     objectValue(declaration, "inputSchema") ??
     objectValue(declaration, "input_schema");
-  const declaredProperties = t.isObjectExpression(schema)
+  const properties = t.isObjectExpression(schema)
     ? objectValue(schema, "properties")
     : undefined;
-  const propertyObject = t.isObjectExpression(declaredProperties)
-    ? declaredProperties
-    : schema;
-  const schemaPropertyNames = t.isObjectExpression(propertyObject)
-    ? propertyObject.properties.flatMap((property) =>
-        t.isObjectProperty(property)
-          ? [
-              semanticStaticPropertyName(property.key, property.computed),
-            ].filter(Boolean)
-          : [],
-      )
+  const schemaPropertyNames = t.isObjectExpression(properties)
+    ? properties.properties.flatMap((property) => {
+        if (!t.isObjectProperty(property)) return [];
+        const key = semanticStaticPropertyKey(property.key, property.computed);
+        return key === null ? [] : [key];
+      })
     : [];
   const metadata = {
     name: name ?? null,

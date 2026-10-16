@@ -329,6 +329,7 @@ export const javaScriptWorkerStaticAnalysisSchema = z
         value: z.string(),
         mechanism: z.string(),
         interpretation: z.literal("candidate").exactOptional(),
+        resolution: z.literal("partial").exactOptional(),
       }),
     ),
     storage: z.array(
@@ -417,6 +418,7 @@ const resourceLimit = z.enum([
   "primitive-candidates",
   "primitive-bytes",
   "expression-depth",
+  "getter-expansion",
 ]);
 const primitive = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const property: z.ZodType<JavaScriptSemanticProperty> = z.lazy(() =>

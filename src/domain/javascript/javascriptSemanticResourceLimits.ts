@@ -7,6 +7,8 @@ import type {
 export const SEMANTIC_PRIMITIVE_CANDIDATE_LIMIT = 256;
 /** Maximum active expression nesting during inert semantic evaluation. */
 export const SEMANTIC_EXPRESSION_DEPTH_LIMIT = 256;
+/** Distinct getter, receiver and path states retained in one precise query. */
+export const SEMANTIC_GETTER_EXPANSION_LIMIT = 512;
 /** Bound normalized strings and transient keys independently of transport limits. */
 export const SEMANTIC_PRIMITIVE_JSON_BYTES_LIMIT = 1_048_576;
 
@@ -17,6 +19,8 @@ const RESOURCE_LIMIT_REASON: Record<JavaScriptSemanticResourceLimit, string> = {
     "Primitive string-byte budget exceeded (maximum 1048576 estimated JSON bytes).",
   "expression-depth":
     "Semantic expression depth budget exceeded (maximum 256 nested expressions).",
+  "getter-expansion":
+    "Getter expansion was conservatively bounded (maximum 512 distinct states or a growing receiver cycle).",
 };
 
 /** Check UTF-16 length against worst-case JSON escaping without flattening. */
@@ -76,25 +80,6 @@ export const semanticResourceLimitUnknown = (
   reason: RESOURCE_LIMIT_REASON[resourceLimit],
   resourceLimit,
 });
-
-/** Collect resource-limit classifications from nested semantic values. */
-export const semanticResourceLimitsIn = (
-  values: readonly JavaScriptSemanticValue[],
-): readonly JavaScriptSemanticResourceLimit[] => {
-  const found = new Set<JavaScriptSemanticResourceLimit>();
-  const pending = [...values];
-  while (pending.length > 0) {
-    const value = pending.pop();
-    if (value === undefined) continue;
-    if (value.status === "unknown" && value.resourceLimit !== undefined)
-      found.add(value.resourceLimit);
-    else if (value.status === "object")
-      for (const property of value.properties) pending.push(property.value);
-    else if (value.status === "array")
-      for (const item of value.items) pending.push(item.value);
-  }
-  return [...found].sort();
-};
 
 /** Display label for one stable resource classification. */
 export const semanticResourceLimitReason = (

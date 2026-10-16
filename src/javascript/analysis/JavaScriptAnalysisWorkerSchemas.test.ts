@@ -1,7 +1,32 @@
 import { expect, it } from "vitest";
 
 import { analyzeJavaScriptStaticSource } from "../../domain/javascript/javascriptStaticAnalysis.js";
-import { javaScriptWorkerStaticAnalysisSchema } from "./JavaScriptAnalysisWorkerSchemas.js";
+import {
+  javaScriptWorkerModuleHeaderSchema,
+  javaScriptWorkerModuleRecordSchema,
+  javaScriptWorkerStaticAnalysisSchema,
+} from "./JavaScriptAnalysisWorkerSchemas.js";
+import { analyzeJavaScriptSemantics } from "../../domain/javascript/javascriptSemanticAnalysis.js";
+import { getterExpansionSource } from "../../../tests/fixtures/javascriptGetterExpansion.js";
+
+it("transfers getter expansion limits and unknown bindings across the worker boundary", () => {
+  const ir = analyzeJavaScriptSemantics(getterExpansionSource());
+  const header = { coverage: ir.coverage, limitations: ir.limitations };
+  expect(
+    javaScriptWorkerModuleHeaderSchema.parse(
+      JSON.parse(JSON.stringify(header)) as unknown,
+    ),
+  ).toEqual(header);
+  for (const value of ir.bindings) {
+    const record = { kind: "binding", value };
+    expect(
+      javaScriptWorkerModuleRecordSchema.parse(
+        JSON.parse(JSON.stringify(record)) as unknown,
+      ),
+    ).toEqual(record);
+  }
+  expect(ir.coverage.resourceLimits).toEqual(["getter-expansion"]);
+});
 
 it("retains candidate endpoint interpretation across the worker boundary", () => {
   const facts = analyzeJavaScriptStaticSource(`
@@ -29,34 +54,39 @@ it("retains candidate endpoint interpretation across the worker boundary", () =>
   ).toBe(false);
 });
 
-it("versions fingerprints through the worker schema and rejects v1", () => {
-  const facts =
-    analyzeJavaScriptStaticSource(`globalThis.webpackChunkApp.push([[1], {
+it.each(["babel-ast-v1", "babel-ast-v2"])(
+  "versions fingerprints through the worker schema and rejects %s",
+  (oldAlgorithm) => {
+    const facts =
+      analyzeJavaScriptStaticSource(`globalThis.webpackChunkApp.push([[1], {
     17(module, exports) { const key = selectKey(); exports.read = value[key]; }
   }]);`);
-  expect(facts.bundler_registrations[0]?.modules[0]).toMatchObject({
-    structural_fingerprint_algorithm: "babel-ast-v2",
-    structural_fingerprint_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-  });
-  expect(
-    javaScriptWorkerStaticAnalysisSchema.safeParse(
-      JSON.parse(JSON.stringify(facts)) as unknown,
-    ).success,
-  ).toBe(true);
-  const old = {
-    ...facts,
-    bundler_registrations: facts.bundler_registrations.map((registration) => ({
-      ...registration,
-      modules: registration.modules.map((module) => ({
-        ...module,
-        structural_fingerprint_algorithm: "babel-ast-v1",
-      })),
-    })),
-  };
-  expect(javaScriptWorkerStaticAnalysisSchema.safeParse(old).success).toBe(
-    false,
-  );
-});
+    expect(facts.bundler_registrations[0]?.modules[0]).toMatchObject({
+      structural_fingerprint_algorithm: "babel-ast-v3",
+      structural_fingerprint_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+    expect(
+      javaScriptWorkerStaticAnalysisSchema.safeParse(
+        JSON.parse(JSON.stringify(facts)) as unknown,
+      ).success,
+    ).toBe(true);
+    const old = {
+      ...facts,
+      bundler_registrations: facts.bundler_registrations.map(
+        (registration) => ({
+          ...registration,
+          modules: registration.modules.map((module) => ({
+            ...module,
+            structural_fingerprint_algorithm: oldAlgorithm,
+          })),
+        }),
+      ),
+    };
+    expect(javaScriptWorkerStaticAnalysisSchema.safeParse(old).success).toBe(
+      false,
+    );
+  },
+);
 
 it("accepts candidate endpoint interpretations from static analysis", () => {
   const facts = analyzeJavaScriptStaticSource(`http.request("POST", target);`);
@@ -72,4 +102,17 @@ it("accepts candidate endpoint interpretations from static analysis", () => {
       JSON.parse(JSON.stringify(facts)) as unknown,
     ).success,
   ).toBe(true);
+});
+
+it("preserves partial request targets through the strict worker schema", () => {
+  const facts = analyzeJavaScriptStaticSource("fetch(endpointUrl);");
+  expect(facts.endpoints).toContainEqual(
+    expect.objectContaining({
+      kind: "network",
+      value: "endpointUrl",
+      resolution: "partial",
+    }),
+  );
+  const serialized = JSON.parse(JSON.stringify(facts)) as unknown;
+  expect(javaScriptWorkerStaticAnalysisSchema.parse(serialized)).toEqual(facts);
 });
