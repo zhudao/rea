@@ -1,4 +1,5 @@
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import { artifactFileCancellationCause } from "../artifacts/ArtifactFileOperation.js";
 import { boundedUtf8Text } from "../process/boundedUtf8Text.js";
 import type { ProviderProcessSnapshot } from "../process/ProviderProcess.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
@@ -48,7 +49,10 @@ export const wabtFailure = (
     (cause instanceof Error && cause.name === "AbortError")
   )
     return new AnalysisCancelledError("inspect_wasm_artifact", {
-      cause,
+      cause:
+        cause instanceof ArtifactReaderFailure
+          ? artifactFileCancellationCause(cause)
+          : cause,
       ...cleanupOptions,
     });
   if (cause instanceof OwnedCommandFailure) {
@@ -133,6 +137,25 @@ export const wabtFailure = (
         cause,
         ...cleanupOptions,
         userMessage: `${reason} Supply WABT 1.0.42 via absolute REA_WABT_BIN_DIRECTORY; REA does not install tools.`,
+      },
+    );
+  if (
+    phase === "artifact" &&
+    cause instanceof ArtifactReaderFailure &&
+    cause.reason === "limit" &&
+    cause.boundary === "file-size"
+  )
+    return new AnalysisResourceConstraintError(
+      "inspect_wasm_artifact",
+      "file-size",
+      reason,
+      { maximum_input_bytes: WABT_LIMITS.inputBytes },
+      {
+        cause,
+        ...cleanupOptions,
+        retryable: false,
+        remediationAction:
+          "Select a suitable stable artifact within the reported input byte allowance. Do not truncate required bytes; retrying the unchanged oversized input will fail again.",
       },
     );
   if (

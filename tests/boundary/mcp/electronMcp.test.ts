@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { afterEach, expect, it, vi } from "vitest";
 import { z } from "zod";
 
@@ -13,6 +14,7 @@ import { createStrippedAsarAddon } from "../../fixtures/strippedAsarAddon.js";
 
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import type { ElectronActiveObservationPort } from "../../../src/application/javascript/ElectronActiveObservationPort.js";
+import type { ElectronObservationPort } from "../../../src/application/javascript/ElectronObservationPort.js";
 import { analyzeJavaScriptApplication } from "../../support/javascriptApplicationScope.js";
 import { CdpElectronProvider } from "../../../src/browser/CdpElectronProvider.js";
 import { createServer } from "../../../src/server/createServer.js";
@@ -26,6 +28,10 @@ import { createElectronActiveObservationFixtureResult } from "../../../src/domai
 import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { AsarArtifactReader } from "../../../src/artifacts/AsarArtifactReader.js";
 import { toolAvailabilityInventory } from "../../../src/contracts/toolOutputSchemaPrimitives.js";
+import { AnalysisCancelledError } from "../../../src/domain/analysisErrorCore.js";
+import { classifyBrowserCompleteness } from "../../../src/domain/browserCompleteness.js";
+import type { ElectronPageInspection } from "../../../src/domain/javascript/electronObservation.js";
+import { err } from "../../../src/domain/result.js";
 
 const browsers: FakeCdpBrowser[] = [];
 const resources: Array<{ close(): Promise<unknown> }> = [];
@@ -91,6 +97,118 @@ afterEach(async () => {
       .splice(0)
       .map(async (path) => rm(path, { recursive: true, force: true })),
   );
+});
+
+it("records completed Electron facts after final detach as server Evidence", async () => {
+  const inspection: ElectronPageInspection = {
+    browser: {
+      product: "Chromium",
+      protocol_version: "1.3",
+      revision: "123",
+      user_agent: "fixture",
+      js_version: "V8",
+    },
+    target: {
+      target_id: "target-1",
+      type: "page",
+      title: "fixture",
+      file_path: "/tmp/index.html",
+      attached: true,
+    },
+    capture_window: {
+      started_at: "2026-01-01T00:00:00.000Z",
+      ended_at: "2026-01-01T00:00:00.001Z",
+      observation_ms: 1,
+    },
+    completeness: classifyBrowserCompleteness({
+      policyFilteredSections: new Set(),
+      attachLimitedSections: new Set(),
+      truncatedSections: new Set(),
+      unavailableSections: new Set(),
+      excluded: [],
+      droppedEvents: {
+        scripts: 0,
+        network_requests: 0,
+        console_events: 0,
+        websocket_connections: 0,
+        websocket_frames: 0,
+        webmcp_tools: 0,
+        timeline_events: 0,
+      },
+    }),
+    frames: [],
+    dom: { total_nodes: 0, nodes: [] },
+    scripts: { total: 0, items: [] },
+    resources: [],
+    workers: [],
+    limitations: [],
+  };
+  const provider: ElectronObservationPort = {
+    identity: () => ({
+      id: "test-electron-observation",
+      name: "Test Electron observation provider",
+      version: "1",
+    }),
+    listTargets: async () => {
+      throw new Error("unexpected target listing");
+    },
+    inspectPage: async () =>
+      err(
+        new AnalysisCancelledError("inspect_electron_page", {
+          partialObservation: {
+            kind: "electron-page-observation",
+            inspection,
+            cleanup: "transport-closed",
+          },
+        }),
+      ),
+  };
+  const session = createTestBinarySession(() => ({
+    execute: () => Promise.resolve(observed(null)),
+    close: () => Promise.resolve(resultOk(null)),
+  }));
+  const server = createServer(
+    { kind: "session", session },
+    {
+      electronObservation: provider,
+    },
+  );
+  const client = new Client({ name: "electron-final-detach", version: "1" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  resources.push(client, server, session);
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+
+  const response = await client.callTool({
+    name: "inspect_electron_page",
+    arguments: {
+      cdp_endpoint: "http://127.0.0.1:9222",
+      target_id: "target-1",
+      observation_ms: 0,
+      include_script_sources: false,
+    },
+  });
+  const { error } = parseMcpToolError(response);
+  expect(error.details).toMatchObject({
+    partial_observation: { kind: "retained-evidence" },
+  });
+  const reference = z
+    .object({
+      partial_observation: z.object({
+        kind: z.literal("retained-evidence"),
+        evidence_id: z.string(),
+      }),
+    })
+    .parse(error.details).partial_observation;
+  expect(session.evidenceById(reference.evidence_id)).toMatchObject({
+    operation: "inspect_electron_page",
+    normalized_result: { target: { target_id: "target-1" } },
+    limitations: expect.arrayContaining([
+      expect.stringContaining("closed its CDP transport"),
+    ]),
+  });
+  await expect(client.ping()).resolves.toEqual({});
 });
 
 it("lets MCP JavaScript analysis continue only with recorded untrusted ASAR bytes", async () => {
@@ -333,6 +451,26 @@ it("runs active Electron scenarios with selected paths and inferred working dire
   const capturedInputs: unknown[] = [];
   const activeResult =
     createElectronActiveObservationFixtureResult(applicationPath);
+  const capturedEvent = activeResult.timeline.events[0];
+  if (capturedEvent === undefined) throw new Error("IPC fixture was empty");
+  const gaps = ["custom-apply", "listener-chain"].map((event, index) => ({
+    ...capturedEvent,
+    sequence: index + 2,
+    kind: "ipc-observation-gap" as const,
+    event,
+    channel: event === "custom-apply" ? "custom" : "opaque-chain",
+    direction: null,
+    receiver: null,
+    target: "ipcMain.on",
+    argument_shapes: [],
+    result_shape: null,
+  }));
+  activeResult.timeline.events.push(...gaps);
+  activeResult.timeline.observed = 3;
+  activeResult.retention.retained = 3;
+  activeResult.retention.estimated_retained_bytes = 1_536;
+  activeResult.retention.observed_runtime = 2;
+  activeResult.coverage.observed_event_families.push("ipc-observation-gap");
   const provider: ElectronActiveObservationPort = {
     identity: () => ({
       id: "test-electron-active",
@@ -365,6 +503,15 @@ it("runs active Electron scenarios with selected paths and inferred working dire
   await server.connect(serverTransport);
   await client.connect(clientTransport);
 
+  const advertised = (await client.listTools()).tools.find(
+    ({ name }) => name === "capture_electron_scenario",
+  );
+  if (advertised?.outputSchema === undefined)
+    throw new Error("Active Electron output schema was not advertised");
+  const validateOutput = new Ajv2020({
+    strict: false,
+    validateFormats: false,
+  }).compile(z.record(z.string(), z.unknown()).parse(advertised.outputSchema));
   const captured = await client.callTool({
     name: "capture_electron_scenario",
     arguments: {
@@ -378,10 +525,21 @@ it("runs active Electron scenarios with selected paths and inferred working dire
     },
   });
   expect(captured.isError, JSON.stringify(captured)).not.toBe(true);
+  expect(
+    validateOutput(captured.structuredContent),
+    JSON.stringify(validateOutput.errors),
+  ).toBe(true);
   expect(captured.structuredContent).toMatchObject({
     normalized_result: {
       application: { process_ownership: "provider-owned" },
       ipc: { events: [{ channel: "readiness:echo" }] },
+      timeline: {
+        events: [
+          { kind: "main-handler-invocation" },
+          { kind: "ipc-observation-gap", channel: "custom" },
+          { kind: "ipc-observation-gap", channel: "opaque-chain" },
+        ],
+      },
       coverage: {
         status: "partial_attach",
         pre_capture_activity: "unavailable",

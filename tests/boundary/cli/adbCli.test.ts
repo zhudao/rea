@@ -1,8 +1,14 @@
 import { chmod, lstat, readFile, unlink } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { basename, dirname } from "node:path";
 import { expect, it, onTestFinished } from "vitest";
 import { z } from "zod";
 
 import { toolContract } from "../../../src/contracts/toolContracts.js";
+import {
+  execFileOutput,
+  execFileOutputFailure,
+} from "../../../src/process/ExecFileOutput.js";
 import {
   expectConfigurationRefusal,
   serveCli as serve,
@@ -11,6 +17,71 @@ import {
   createTestWorkspace,
   removeTestWorkspace,
 } from "../../support/workspace/workspaceFixture.js";
+
+it.skipIf(process.platform === "win32").each([
+  { exit: 1, stdout: "", stderr: "adb: error: closed", overwrite: false },
+  { exit: 1, stdout: "", stderr: "adb: error: closed", overwrite: true },
+  { exit: 1, stdout: "unexpected probe output", stderr: "", overwrite: false },
+  { exit: 2, stdout: "", stderr: "", overwrite: false },
+])("refuses an ambiguous destination probe before push: %j", async (probe) => {
+  const workspace = await createTestWorkspace("rea-adb-probe-cli-");
+  onTestFinished(() => removeTestWorkspace(workspace.root));
+  const source = await workspace.write("payload.bin", "replacement");
+  await workspace.write("device-file", "original");
+  const adb = await workspace.write(
+    "adb",
+    `#!/bin/sh
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+printf '%s\\n' "$3" >> "$root/calls"
+if [ "$1" = version ]; then
+  printf 'Android Debug Bridge version 1.0.41\\nVersion 34.0.5-cli\\nInstalled as %s\\n' "$0"
+  exit 0
+fi
+if [ "$3" = shell ] && [ "$4" = test ]; then
+  printf '%s' '${probe.stdout}'
+  printf '%s' '${probe.stderr}' >&2
+  exit ${String(probe.exit)}
+fi
+if [ "$3" = push ]; then cp "$4" "$root/device-file"; exit 0; fi
+exit 1
+`,
+  );
+  await chmod(adb, 0o755);
+  const result = await execFileOutput(
+    process.execPath,
+    [
+      "scripts/rea.mjs",
+      "push-adb-file",
+      "device",
+      source,
+      "/data/local/tmp/payload.bin",
+      ...(probe.overwrite ? ["--overwrite"] : []),
+      "--json",
+    ],
+    {
+      env: { ...process.env, REA_ADB_PATH: adb },
+      timeout: 20_000,
+      stopSignal: "SIGTERM",
+      maxBuffer: 1024 * 1024,
+    },
+  ).then(
+    (output) => ({ exitCode: 0, stdout: output.stdout }),
+    (cause: unknown) => {
+      const failure = execFileOutputFailure(cause);
+      if (failure === undefined) throw cause;
+      return { exitCode: failure.code, stdout: failure.stdout };
+    },
+  );
+  expect(result.exitCode).toBe(1);
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    code: "unreadable_output",
+  });
+  if (probe.stderr !== "") expect(result.stdout).toContain(probe.stderr);
+  expect(await readFile(workspace.path("device-file"), "utf8")).toBe(
+    "original",
+  );
+  expect(await readFile(workspace.path("calls"), "utf8")).toBe("\nshell\n");
+});
 
 it.each([
   [
@@ -100,7 +171,7 @@ it.skipIf(process.platform === "win32")(
   async () => {
     const workspace = await createTestWorkspace("rea-adb-install-state-");
     onTestFinished(() => removeTestWorkspace(workspace.root));
-    const apk = await workspace.write("app.apk", "apk");
+    const apk = await workspace.write("app with spaces.apk", "apk");
     const adb = await workspace.write(
       "adb",
       `#!/bin/sh
@@ -111,6 +182,9 @@ if [ "$1" = version ]; then
   exit 0
 fi
 if [ "$1" = -s ] && [ "$3" = install ]; then
+  if [ "$4" = -r ]; then selected="$5"; else selected="$4"; fi
+  cmp "$selected" "$root/app with spaces.apk" || exit 1
+  printf '%s\\n' "$selected" >> "$root/snapshots"
   if [ -f "$root/installed" ]; then
     if [ "$4" != -r ]; then
       printf 'Failure [INSTALL_FAILED_ALREADY_EXISTS]\\n'
@@ -184,14 +258,33 @@ exit 1
     expect(await readFile(workspace.path("events"), "utf8")).toBe(
       "fresh-install\nreplacement\nfresh-install\n",
     );
+    const snapshots = (await readFile(workspace.path("snapshots"), "utf8"))
+      .trim()
+      .split("\n");
+    expect(snapshots).toHaveLength(3);
+    expect(new Set(snapshots).size).toBe(3);
+    for (const snapshot of snapshots) {
+      expect(snapshot).not.toBe(apk);
+      expect(basename(snapshot)).toBe(basename(apk));
+      await expect(lstat(dirname(snapshot))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    }
+    expect(await readFile(apk, "utf8")).toBe("apk");
+    for (const receipt of [freshReplace, existingReplace, freshDefault])
+      expect(receipt.data.normalized_result).toMatchObject({
+        apk_path: apk,
+        bytes: 3,
+        sha256: createHash("sha256").update("apk").digest("hex"),
+      });
     const calls = await readFile(workspace.path("calls"), "utf8");
     expect(calls.split("\n").filter((line) => line !== "")).toEqual([
       "version",
-      `-s emulator-5554 install -r ${apk}`,
+      `-s emulator-5554 install -r ${snapshots[0]}`,
       "version",
-      `-s emulator-5554 install -r ${apk}`,
+      `-s emulator-5554 install -r ${snapshots[1]}`,
       "version",
-      `-s emulator-5554 install ${apk}`,
+      `-s emulator-5554 install ${snapshots[2]}`,
     ]);
   },
 );

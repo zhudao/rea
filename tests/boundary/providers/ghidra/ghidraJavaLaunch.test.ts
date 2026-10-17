@@ -1,4 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { ok as javaProbeOk } from "../../../../src/domain/result.js";
+import type { GhidraJavaObservation } from "../../../../src/ghidra/GhidraJavaProbe.js";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { describe, expect, it, onTestFinished } from "vitest";
@@ -85,6 +87,7 @@ if (mode === "env-failure" || (probe === "-vmargs" && mode === "vm-failure")) {
     javaHome,
     ...(javaVmName === null ? {} : { javaVmName }),
     analyzeHeadlessPath: join(root, "ghidra", "support", "analyzeHeadless"),
+    configurationDirectoryName: "ghidra_12.1.4_PUBLIC",
     bridgeScriptPath: join(root, "ReaGhidraBridge.java"),
     spawnProcess: async (options) => {
       analysisArguments.push(options.arguments);
@@ -109,6 +112,68 @@ if (mode === "env-failure" || (probe === "-vmargs" && mode === "vm-failure")) {
   });
   return { session, launcher, analysisArguments, controller };
 };
+
+describe.skipIf(process.platform === "win32")(
+  "Ghidra inspected configuration identity",
+  () => {
+    it("prepares the inspected release directory without reinterpreting changed properties", async () => {
+      const { session, launcher } = await fixture("quiet");
+      const propertiesRoot = join(
+        session.runtimeRoot,
+        "..",
+        "ghidra",
+        "Ghidra",
+      );
+      await mkdir(propertiesRoot, { recursive: true });
+      await writeFile(
+        join(propertiesRoot, "application.properties"),
+        "application.version=12.1.2\napplication.release.name=OTHER\n",
+      );
+      const launched = await launcher.launch(session);
+      if (!launched.ok) throw launched.error;
+      expect(
+        (
+          await stat(
+            join(
+              session.runtimeRoot,
+              "config",
+              "ghidra",
+              "ghidra_12.1.4_PUBLIC",
+            ),
+          )
+        ).isDirectory(),
+      ).toBe(true);
+      await expect(
+        stat(
+          join(session.runtimeRoot, "config", "ghidra", "ghidra_12.1.2_OTHER"),
+        ),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("rejects unresolved identity before creating runtime directories or starting Java", async () => {
+      const { session, launcher, analysisArguments } = await fixture("quiet");
+      const unresolved = new GhidraHeadlessLauncher({
+        ...launcher.options,
+        configurationDirectoryName: null,
+      });
+      const launched = await unresolved.launch(session);
+      expect(launched).toMatchObject({
+        ok: false,
+        error: {
+          cause: {
+            message: expect.stringContaining(
+              "configuration directory identity is unresolved",
+            ),
+          },
+        },
+      });
+      expect(analysisArguments).toEqual([]);
+      await expect(stat(session.runtimeRoot)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    });
+  },
+);
 
 describe.skipIf(process.platform === "win32")(
   "Ghidra LaunchSupport JVM compatibility",
@@ -380,20 +445,21 @@ describe.skipIf(process.platform === "win32")(
             readText: () =>
               "application.version=12.1.4\napplication.java.min=21\n",
             executable: () => true,
-            probeJava: () => ({
-              osArch: process.arch === "arm64" ? "aarch64" : "amd64",
-              osName:
-                process.platform === "darwin"
-                  ? "Mac OS X"
-                  : process.platform === "win32"
-                    ? "Windows 11"
-                    : "Linux",
-              version: "21.0.12",
-              major: 21,
-              home: "/fixture/jdk",
-              bits: 64,
-              runtime: "jdk",
-            }),
+            probeJava: () =>
+              javaProbeOk<GhidraJavaObservation>({
+                osArch: process.arch === "arm64" ? "aarch64" : "amd64",
+                osName:
+                  process.platform === "darwin"
+                    ? "Mac OS X"
+                    : process.platform === "win32"
+                      ? "Windows 11"
+                      : "Linux",
+                version: "21.0.12",
+                major: 21,
+                home: "/fixture/jdk",
+                bits: 64,
+                runtime: "jdk",
+              }),
           },
           (options) => new GhidraClient({ ...options, launcher }),
         );
@@ -442,3 +508,50 @@ describe.skipIf(process.platform === "win32")(
     );
   },
 );
+
+it.each([null, "caller stopped", new Error("caller stopped")] as const)(
+  "retains the helper producer's exact %s cancellation reason",
+  async (reason) => {
+    const { ghidraJavaLaunch, GhidraLaunchSupportError } =
+      await import("../../../../src/ghidra/GhidraJavaLaunch.js");
+    const controller = new AbortController();
+    controller.abort(reason);
+    const failure: unknown = await ghidraJavaLaunch({
+      platform: process.platform,
+      analyzeHeadlessPath: "/unused-ghidra/support/analyzeHeadless",
+      homeRoot: "/unused-runtime/home",
+      tempRoot: "/unused-runtime/tmp",
+      arguments: [],
+      environment: {},
+      signal: controller.signal,
+      onStderr: () => {
+        throw new Error("An aborted probe must not produce output");
+      },
+    }).catch((cause: unknown) => cause);
+    expect(failure).toBeInstanceOf(GhidraLaunchSupportError);
+    if (!(failure instanceof GhidraLaunchSupportError))
+      throw new Error("Expected helper failure");
+    expect(failure.cancellation?.reason).toBe(reason);
+    expect(failure.outcome).toBeUndefined();
+  },
+);
+
+it("does not infer helper cancellation from an arbitrary failure's display code", async () => {
+  const { GhidraLaunchSupportError } =
+    await import("../../../../src/ghidra/GhidraJavaLaunch.js");
+  const cause = Object.assign(new Error("ordinary failure"), {
+    code: "ABORT_ERR",
+    stdout: "out",
+    stderr: "err",
+    killed: true,
+    outputTruncated: true,
+  });
+  const failure = new GhidraLaunchSupportError("-envvars", cause);
+  expect(failure.cancellation).toBeUndefined();
+  expect(failure.outcome).toMatchObject({
+    killed: true,
+    outputTruncated: true,
+    stdout: "out",
+    stderr: "err",
+  });
+});

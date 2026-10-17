@@ -83,7 +83,7 @@ describe("detached provider and target metadata", () => {
     const [first] = await createBinarySessionTargets();
     const session = createTestBinarySession(createCacheProvider([]));
     expect((await session.open(first)).ok).toBe(true);
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       analysis_run: {
         run_id: expect.any(String),
         process_lineage: { status: "not_observed" },
@@ -127,12 +127,12 @@ describe("detached provider and target metadata", () => {
       }),
     };
     const session = createTestBinarySession(provider);
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       open: false,
       provider_operation_health: null,
     });
     expect((await session.open(first)).ok).toBe(true);
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       open: true,
       provider_operation_health: {
         state: "busy",
@@ -149,7 +149,7 @@ describe("detached provider and target metadata", () => {
       },
     });
     healthState = "exited";
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       open: true,
       provider_operation_health: {
         state: "exited",
@@ -166,7 +166,7 @@ describe("detached provider and target metadata", () => {
       },
     });
     await session.close();
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       open: false,
       provider_operation_health: null,
     });
@@ -942,7 +942,7 @@ describe("provider health and availability", () => {
     });
     expect((await session.open(first)).ok).toBe(true);
     expect((await session.execute("address_name", {})).ok).toBe(false);
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       capabilities: expect.arrayContaining([
         expect.objectContaining({
           provider: {
@@ -963,7 +963,7 @@ describe("provider health and availability", () => {
     });
     expect(changes).toBe(1);
     expect((await session.open(second)).ok).toBe(true);
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       capabilities: expect.arrayContaining([
         expect.objectContaining({
           provider: {
@@ -1020,7 +1020,7 @@ describe("provider health and availability", () => {
       { ok: true },
     );
     expect(delivered).toBe(1);
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       capabilities: expect.arrayContaining([
         expect.objectContaining({
           provider: {
@@ -1123,13 +1123,13 @@ describe("typed unavailability without dispatching", () => {
     const session = createTestBinarySession(() => client(created++ === 1));
     expect((await session.open(first)).ok).toBe(true);
     expect((await session.open(second)).ok).toBe(false);
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       open: true,
       sha256:
         "7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed",
       architecture: null,
     });
-    expect(JSON.stringify(session.status())).toContain("first.hop");
+    expect(JSON.stringify(await session.status())).toContain("first.hop");
     expect(created).toBe(3);
   });
 
@@ -1164,7 +1164,7 @@ describe("typed unavailability without dispatching", () => {
     expect((await secondCall).ok).toBe(true);
     expect((await closing).ok).toBe(true);
     expect((await afterClose).ok).toBe(false);
-    expect(session.status()).toMatchObject({ open: false });
+    expect(await session.status()).toMatchObject({ open: false });
     expect(clients[0]?.closed).toBe(1);
     expect(clients[1]?.closed).toBe(1);
   });
@@ -1327,9 +1327,10 @@ describe("cancellation during profile resolution", () => {
     const [first] = await createBinarySessionTargets();
     const provider = createCacheProvider([]);
     const controller = new AbortController();
+    const failure = new Error("Profile resolution failed before cancellation");
     provider.resolveAnalysisProfile = () => {
-      controller.abort();
-      return Promise.reject(new Error("Profile resolution cancelled"));
+      controller.abort({ caller: "late profile rejection" });
+      return Promise.reject(failure);
     };
     const session = createTestBinarySession(provider);
     try {
@@ -1337,7 +1338,11 @@ describe("cancellation during profile resolution", () => {
         session.open(first, { signal: controller.signal }),
       ).resolves.toMatchObject({
         ok: false,
-        error: { _tag: "AnalysisCancelledError", operation: "open_binary" },
+        error: {
+          _tag: "ProviderAdapterError",
+          operation: "resolve_analysis_profile",
+          cause: failure,
+        },
       });
       // Allow Node to report any rejection abandoned by the cancellation path.
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1347,35 +1352,66 @@ describe("cancellation during profile resolution", () => {
     }
   });
 
-  it("cancels profile resolution even when the provider ignores its signal", async () => {
+  it("joins a signal-ignoring profile producer before cancellation and session close settle", async () => {
     const [first] = await createBinarySessionTargets();
     const provider = createCacheProvider([]);
+    if (provider.resolveAnalysisProfile === undefined)
+      throw new Error("Expected the fixture profile resolver");
+    const resolveProfile = provider.resolveAnalysisProfile.bind(provider);
+    const admitted = createDeferred<void>();
+    const release = createDeferred<void>();
     let observedSignal: AbortSignal | undefined;
     let created = 0;
-    provider.resolveAnalysisProfile = (_target, options) => {
+    provider.resolveAnalysisProfile = async (target, options) => {
       observedSignal = options?.signal;
-      return new Promise<never>(() => undefined);
+      admitted.resolve();
+      await release.promise;
+      return resolveProfile(target);
     };
     provider.createClient = () => {
-      created += 1;
+      created++;
       return new ControllableAnalysisClient();
     };
     const session = createTestBinarySession(provider);
     const controller = new AbortController();
-    const opening = session.open(first, { signal: controller.signal });
-    while (observedSignal === undefined)
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(observedSignal).toBe(controller.signal);
-
-    controller.abort();
-
-    await expect(opening).resolves.toMatchObject({
-      ok: false,
-      error: { _tag: "AnalysisCancelledError", operation: "open_binary" },
+    const reason = { caller: "profile cancellation" };
+    let openSettled = false;
+    const opening = session
+      .open(first, { signal: controller.signal })
+      .then((result) => {
+        openSettled = true;
+        return result;
+      });
+    await admitted.promise;
+    controller.abort(reason);
+    let closeSettled = false;
+    const closing = session.close().then((result) => {
+      closeSettled = true;
+      return result;
     });
-    expect(created).toBe(0);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(observedSignal?.reason).toBe(reason);
+      expect(openSettled).toBe(false);
+      expect(closeSettled).toBe(false);
+      expect(await session.status()).toMatchObject({ cleanup_pending: true });
+      release.resolve();
+      await expect(opening).resolves.toMatchObject({
+        ok: false,
+        error: { _tag: "AnalysisCancelledError", cause: reason },
+      });
+      expect(await closing).toEqual(resultOk(null));
+      expect(created).toBe(0);
+      expect(await session.status()).toMatchObject({ cleanup_pending: false });
+    } finally {
+      release.resolve();
+      await Promise.all([opening, closing]);
+      await session.close();
+    }
   });
+});
 
+describe("cancellation during client transitions", () => {
   it("cancels a call while it waits for a transition", async () => {
     const [first] = await createBinarySessionTargets();
     const health = createDeferred<ReturnType<typeof ok>>();
@@ -1416,7 +1452,7 @@ describe("cancellation during profile resolution", () => {
     expect(clients[1]?.closed).toBe(1);
     expect(clients[0]?.closed).toBe(1);
     expect(clients[2]?.closed).toBe(0);
-    expect(JSON.stringify(session.status())).toContain("first.hop");
+    expect(JSON.stringify(await session.status())).toContain("first.hop");
     await session.close();
     await session.close();
     expect(clients[2]?.closed).toBe(1);
@@ -1459,7 +1495,7 @@ describe("cancellation during profile resolution", () => {
     expect((await session.open(first)).ok).toBe(true);
 
     expect(await session.close()).toEqual(err(cleanupError));
-    expect(session.status()).toMatchObject({
+    expect(await session.status()).toMatchObject({
       open: false,
       analysis_activity: { status: "not_observed", providers: [] },
     });
@@ -1486,7 +1522,7 @@ describe("no replacement start", () => {
 
     expect(await session.open(second)).toEqual(err(cleanupError));
     expect(created).toBe(1);
-    expect(session.status()).toMatchObject({ open: false });
+    expect(await session.status()).toMatchObject({ open: false });
   });
 });
 

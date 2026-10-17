@@ -20,28 +20,34 @@ it("preserves the binary cleanup default and an explicitly owned nonbinary opera
 });
 
 it.each([false, true])(
-  "reports only live primary resources after cleanup recovery is %s",
-  (recovered) => {
-    const primary = new ProviderCleanupError("adb", ["descriptor"], {
-      reason: "descriptor close failed",
-    });
-    if (recovered) primary.resolveCleanup();
-    const cleanup = new ProviderCleanupError("adb", ["runtime-root"], {
-      reason: "root removal failed",
-    });
-    const combined = analysisErrorWithCleanupFailure(primary, cleanup);
-    expect(combined.cleanupResources).toEqual(
-      recovered ? ["runtime-root"] : ["descriptor", "runtime-root"],
+  "combines only live cleanup resources when primary resolution is %s",
+  (resolved) => {
+    const primary = new ProviderCleanupError(
+      "adb",
+      ["publication-handle"],
+      { reason: "first descriptor close failed" },
+      { operation: "capture_adb_screen" },
     );
+    if (resolved) primary.resolveCleanup();
+    const cleanup = new ProviderCleanupError("adb", ["runtime-root"], {
+      reason: "workspace removal failed",
+    });
+
+    const combined = analysisErrorWithCleanupFailure(primary, cleanup);
     expect(projectAnalysisError(combined)).toMatchObject({
       code: "cleanup_incomplete",
       details: {
+        resources: resolved
+          ? ["runtime-root"]
+          : ["publication-handle", "runtime-root"],
         diagnostics: {
           primary_error: {
-            details: { diagnostics: { reason: "descriptor close failed" } },
+            details: {
+              diagnostics: { reason: "first descriptor close failed" },
+            },
           },
           cleanup_error: {
-            details: { diagnostics: { reason: "root removal failed" } },
+            details: { diagnostics: { reason: "workspace removal failed" } },
           },
         },
       },
@@ -51,5 +57,42 @@ it.each([false, true])(
       primary,
       cleanup,
     ]);
+  },
+);
+
+it.each(["alpha", "beta"])(
+  "projects only unresolved resources through nested cleanup groups when %s closes first",
+  (first) => {
+    const alpha = new ProviderCleanupError("alpha", ["alpha-file"], {});
+    const beta = new ProviderCleanupError("beta", ["beta-file"], {});
+    const third = new ProviderCleanupError("third", ["third-file"], {});
+    const children = new ProviderCleanupError(
+      "rea",
+      ["alpha-file", "beta-file"],
+      {},
+    ).bindCleanupDependencies([alpha, beta]);
+    const outer = new ProviderCleanupError(
+      "rea",
+      ["alpha-file", "beta-file", "third-file"],
+      {},
+    ).bindCleanupDependencies([children, third]);
+    const released = first === "alpha" ? alpha : beta;
+    const remaining = first === "alpha" ? beta : alpha;
+    released.resolveCleanup();
+    expect(outer.cleanupIncomplete).toBe(true);
+    expect(outer.cleanupResources).toEqual([
+      ...remaining.cleanupResources,
+      "third-file",
+    ]);
+    expect(projectAnalysisError(outer)).toMatchObject({
+      code: "cleanup_incomplete",
+      details: { resources: [...remaining.cleanupResources, "third-file"] },
+    });
+    remaining.resolveCleanup();
+    expect(outer.cleanupIncomplete).toBe(true);
+    expect(outer.cleanupResources).toEqual(["third-file"]);
+    third.resolveCleanup();
+    expect(outer.cleanupIncomplete).toBe(false);
+    expect(projectAnalysisError(outer).code).not.toBe("cleanup_incomplete");
   },
 );

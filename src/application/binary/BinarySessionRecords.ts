@@ -55,17 +55,16 @@ export interface WorkflowSnapshotRecordInput {
 export abstract class BinarySessionRecords {
   readonly #records: InvestigationRecords;
   readonly #writeResources = new ArtifactResourceScope();
+
+  protected get hasPendingFileResources(): boolean {
+    return this.#writeResources.hasPending;
+  }
   readonly #snapshot = new AnalysisSnapshotCache();
   #snapshotInvalidated = false;
   readonly #snapshotListeners = new Set<() => void | Promise<void>>();
 
   constructor(records: InvestigationRecords = new InvestigationRecords()) {
     this.#records = records;
-  }
-
-  /** Snapshot staging retained after a failed resource cleanup attempt. */
-  protected get hasPendingWriteResources(): boolean {
-    return this.#writeResources.hasPending;
   }
 
   /** Observe changes to the mutable current analysis snapshot resource. */

@@ -1,6 +1,82 @@
 import { describe, expect, it } from "vitest";
 
-import { parseAmStartOutput } from "./AdbShellOutput.js";
+import {
+  parseAmStartOutput,
+  parseWmDensityOutput,
+  parseWindowFocusOutput,
+} from "./AdbShellOutput.js";
+
+describe("parseWindowFocusOutput", () => {
+  it("separates missing declarations from explicit absence and retains source lines", () => {
+    expect(parseWindowFocusOutput("no declarations\n")).toEqual({
+      focusedWindow: null,
+      focusedApp: null,
+    });
+    expect(
+      parseWindowFocusOutput("  mCurrentFocus=null\nmFocusedApp=null\n"),
+    ).toEqual({
+      focusedWindow: { value: null, rawLine: "  mCurrentFocus=null" },
+      focusedApp: { value: null, rawLine: "mFocusedApp=null" },
+    });
+  });
+
+  it("does not reinterpret later declarations after the first explicitly absent one", () => {
+    expect(
+      parseWindowFocusOutput(
+        "mCurrentFocus=null\nmCurrentFocus=Window{later}\nmFocusedApp=ActivityRecord{current}\n",
+      ),
+    ).toEqual({
+      focusedWindow: { value: null, rawLine: "mCurrentFocus=null" },
+      focusedApp: {
+        value: "ActivityRecord{current}",
+        rawLine: "mFocusedApp=ActivityRecord{current}",
+      },
+    });
+  });
+});
+
+describe("parseWmDensityOutput", () => {
+  it("reads labeled physical and override densities", () => {
+    expect(
+      parseWmDensityOutput("Physical density: 420\nOverride density: 480\n"),
+    ).toEqual({ physical: 420, override: 480 });
+    expect(parseWmDensityOutput("Physical density: 420\n")).toEqual({
+      physical: 420,
+      override: null,
+    });
+  });
+
+  // Older builds print the physical density as a bare number
+  // (morluto/rea#3942); it must not be lost as an unread declaration.
+  it("reads a bare numeric density as the physical density", () => {
+    expect(parseWmDensityOutput("420\n")).toEqual({
+      physical: 420,
+      override: null,
+    });
+    expect(parseWmDensityOutput("420\r\n")).toEqual({
+      physical: 420,
+      override: null,
+    });
+  });
+
+  it("prefers a labeled physical density over a bare number", () => {
+    expect(parseWmDensityOutput("560\nPhysical density: 420\n")).toEqual({
+      physical: 420,
+      override: null,
+    });
+  });
+
+  it("reports no density for unrecognized output", () => {
+    expect(parseWmDensityOutput("")).toEqual({
+      physical: null,
+      override: null,
+    });
+    expect(parseWmDensityOutput("420dpi\n")).toEqual({
+      physical: null,
+      override: null,
+    });
+  });
+});
 
 const starting =
   "Starting: Intent { act=android.intent.action.MAIN cmp=com.example/.Main }";

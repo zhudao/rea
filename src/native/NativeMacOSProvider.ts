@@ -28,6 +28,7 @@ import {
   isMachOFormat,
   type BinaryTarget,
 } from "../domain/binaryTargetTypes.js";
+import { isAppleDispatchMetadataTarget } from "../domain/native/objcSwiftMetadata.js";
 import { toolContract } from "../contracts/toolContracts.js";
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import type { EvidenceLocation } from "../domain/evidence.js";
@@ -43,6 +44,7 @@ import { BinaryTargetError } from "../domain/configurationErrors.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { regularFileCancellation } from "../filesystem/OwnedRegularFile.js";
 import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
 import type { NativeUiObservationResult } from "../domain/native/nativeUiObservation.js";
 import {
@@ -186,10 +188,7 @@ class NativeMacOSClient implements AnalysisClient {
             },
           ),
         );
-      if (
-        this.target.kind !== "executable" ||
-        !isMachOFormat(this.target.format)
-      )
+      if (!isAppleDispatchMetadataTarget(this.target))
         return err(
           new AnalysisCapabilityUnavailableError(
             IDENTITY.id,
@@ -213,6 +212,13 @@ class NativeMacOSClient implements AnalysisClient {
         );
       } catch (cause) {
         if (cause instanceof AnalysisError) return err(cause);
+        const cancellation = regularFileCancellation(cause);
+        if (cancellation !== undefined)
+          return err(
+            new AnalysisCancelledError(operation, {
+              cause: cancellation.reason,
+            }),
+          );
         return err(
           options?.signal?.aborted
             ? new AnalysisCancelledError(operation)
@@ -925,6 +931,58 @@ const translateCommandFailure = (
   operation: NativeToolName,
   failure: NativeCommandFailure,
 ): AnalysisError => {
+  const preparation = failure.preparationFailure;
+  if (preparation !== undefined) {
+    const marker = preparation.cleanupFailure;
+    const compiler = preparation.compilerOutcome;
+    const options = {
+      cause: failure,
+      ...(preparation.capturedOutput === undefined
+        ? {}
+        : { capturedOutput: preparation.capturedOutput }),
+      ...(marker === undefined
+        ? {}
+        : {
+            cleanup: {
+              reason: marker.message,
+              resources: marker.cleanupResources,
+            },
+          }),
+      diagnostics: {
+        phase: "process-preparation",
+        tool: failure.tool,
+        reason: failure.reason,
+        detail: preparation.message,
+        ...(compiler === undefined
+          ? {}
+          : {
+              compiler_outcome: {
+                outcome: compiler.outcome,
+                code: compiler.code,
+                signal: compiler.signal,
+                ...(compiler.timeoutMs === undefined
+                  ? {}
+                  : { timeout_ms: compiler.timeoutMs }),
+              },
+            }),
+      },
+    };
+    const error =
+      preparation.cancellation === undefined
+        ? new ProviderAdapterError(IDENTITY.id, operation, options)
+        : failure.reason === "timeout"
+          ? new AnalysisTimeoutError(operation, NATIVE_COMMAND_TIMEOUT_MS, {
+              ...options,
+              cause: preparation.cancellation.reason,
+            })
+          : new AnalysisCancelledError(operation, {
+              ...options,
+              cause: preparation.cancellation.reason,
+            });
+    return marker === undefined
+      ? error
+      : error.bindCleanupDependencies([marker]);
+  }
   const capturedOutput =
     failure.capture === null
       ? undefined

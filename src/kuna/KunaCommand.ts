@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { stat } from "node:fs/promises";
-import { Transform } from "node:stream";
+import { Transform, type Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import {
   AnalysisCancelledError,
   AnalysisResourceConstraintError,
@@ -16,12 +17,12 @@ import {
   OwnedCommandFailure,
   runOwnedCommand,
 } from "../process/OwnedCommand.js";
+import { hashStableFile } from "../filesystem/StableFileHash.js";
+import type { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import {
-  hashStableFile,
-  StableFileHashCleanupFailure,
-} from "../filesystem/StableFileHash.js";
-import { OwnedRegularFileCleanupFailure } from "../filesystem/RegularFile.js";
-import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
+  RegularFileCleanupFailure,
+  regularFileCancellation,
+} from "../filesystem/OwnedRegularFile.js";
 import type {
   OwnedProviderProcessSpawnOptions,
   ProviderProcessSnapshot,
@@ -56,8 +57,15 @@ export interface KunaCommandRequest {
   readonly timeoutMs: number;
   /** The deadline callers configured, reported when the run times out. */
   readonly reportedTimeoutMs: number;
+  /** Buffered stderr bytes, plus stdout bytes unless `stdout` consumes them. */
   readonly outputBytes: number;
+  /** Parses stdout as it arrives instead of buffering it; see `runOwnedCommand`. */
+  readonly stdout?: Writable | undefined;
   readonly signal: AbortSignal;
+  readonly retainFailedFileClose: (
+    owner: OwnedFileHandle,
+    resource: string,
+  ) => void;
   readonly launcher?: KunaProcessLauncher | undefined;
 }
 
@@ -71,7 +79,7 @@ export type KunaCommandOutcome =
   | {
       readonly kind: "failed";
       readonly error: AnalysisError;
-      readonly fileCleanup?: OwnedRegularFileCleanupFailure;
+      readonly fileCleanupFailure?: RegularFileCleanupFailure;
     }
   | {
       readonly kind: "retained";
@@ -82,6 +90,38 @@ export type KunaCommandOutcome =
 
 const message = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
+
+/** Preserve the operation's typed failure while attaching descriptor cleanup. */
+export const kunaFileCleanupError = (
+  failure: RegularFileCleanupFailure,
+  operation: string,
+): AnalysisError => {
+  const cleanup = new ProviderCleanupError(
+    KUNA_PROVIDER_ID,
+    [failure.path],
+    { reason: message(failure.cleanupCause) },
+    { cause: failure, operation },
+  );
+  const cancellation = regularFileCancellation(failure);
+  if (cancellation !== undefined)
+    return new AnalysisCancelledError(operation, {
+      cause: cancellation.reason,
+      cleanup: {
+        reason: message(failure.cleanupCause),
+        resources: [failure.path],
+      },
+    });
+  if (failure.outcome.kind === "completed") return cleanup;
+  const primaryCause = failure.outcome.cause;
+  const primary =
+    primaryCause instanceof AnalysisError
+      ? primaryCause
+      : new ProviderAdapterError(KUNA_PROVIDER_ID, operation, {
+          cause: primaryCause,
+          userMessage: `Kuna ${operation} failed: ${message(primaryCause)}`,
+        });
+  return analysisErrorWithCleanupFailure(primary, cleanup, operation);
+};
 
 /** File metadata that, unchanged, lets a verified digest stand without re-hashing. */
 const verifiedExecutables = new Map<
@@ -96,6 +136,7 @@ const verifiedExecutables = new Map<
 const verifyExecutable = async (
   installation: KunaInstallation,
   signal: AbortSignal,
+  retainFailedFileClose: KunaCommandRequest["retainFailedFileClose"],
 ): Promise<string | undefined> => {
   const status = await stat(installation.executable, { bigint: true });
   const identity = [
@@ -108,7 +149,13 @@ const verifyExecutable = async (
   const known = verifiedExecutables.get(installation.executable);
   let sha256 = known?.identity === identity ? known.sha256 : undefined;
   if (sha256 === undefined) {
-    sha256 = (await hashStableFile(installation.executable, signal)).sha256;
+    sha256 = (
+      await hashStableFile(installation.executable, {
+        signal,
+        retainFailedClose: (owner) =>
+          retainFailedFileClose(owner, installation.executable),
+      })
+    ).sha256;
     verifiedExecutables.set(installation.executable, { identity, sha256 });
   }
   return sha256 === installation.sha256 ? undefined : sha256;
@@ -120,7 +167,11 @@ export const runKunaCommand = async (
 ): Promise<KunaCommandOutcome> => {
   const { installation } = request;
   try {
-    const changed = await verifyExecutable(installation, request.signal);
+    const changed = await verifyExecutable(
+      installation,
+      request.signal,
+      request.retainFailedFileClose,
+    );
     if (changed !== undefined)
       return {
         kind: "failed",
@@ -133,46 +184,25 @@ export const runKunaCommand = async (
         }),
       };
   } catch (cause: unknown) {
-    if (cause instanceof OwnedRegularFileCleanupFailure) {
-      const primary = request.signal.aborted
-        ? new AnalysisCancelledError(request.operation, { cause: cause.cause })
-        : new ProviderAdapterError(KUNA_PROVIDER_ID, request.operation, {
-            cause: cause.cause,
-            userMessage: `Cannot verify ${installation.executable}: ${message(cause.cause)}`,
-          });
-      const cleanup = new ProviderCleanupError(
-        KUNA_PROVIDER_ID,
-        [cause.path],
-        {
-          reason:
-            cause.cleanupCause instanceof Error
-              ? cause.cleanupCause.message
-              : String(cause.cleanupCause),
-          ...(cause instanceof StableFileHashCleanupFailure &&
-          cause.completedHash !== undefined
-            ? { completed_hash: cause.completedHash }
-            : {}),
-        },
-        { operation: request.operation, cause: cause.cleanupCause },
-      );
+    if (cause instanceof RegularFileCleanupFailure) {
       return {
         kind: "failed",
-        error: analysisErrorWithCleanupFailure(
-          primary,
-          cleanup,
-          request.operation,
-        ),
-        fileCleanup: cause,
+        error: kunaFileCleanupError(cause, request.operation),
+        fileCleanupFailure: cause,
       };
     }
+    const cancellation = regularFileCancellation(cause);
     return {
       kind: "failed",
-      error: request.signal.aborted
-        ? new AnalysisCancelledError(request.operation, { cause })
-        : new ProviderAdapterError(KUNA_PROVIDER_ID, request.operation, {
-            cause,
-            userMessage: `Cannot verify ${installation.executable}: ${message(cause)}`,
-          }),
+      error:
+        cancellation !== undefined
+          ? new AnalysisCancelledError(request.operation, {
+              cause: cancellation.reason,
+            })
+          : new ProviderAdapterError(KUNA_PROVIDER_ID, request.operation, {
+              cause,
+              userMessage: `Cannot verify ${installation.executable}: ${message(cause)}`,
+            }),
     };
   }
   try {
@@ -190,6 +220,7 @@ export const runKunaCommand = async (
       {
         timeoutMs: Math.max(1, request.timeoutMs),
         diagnosticBytes: request.outputBytes,
+        ...(request.stdout === undefined ? {} : { stdout: request.stdout }),
       },
       {
         signal: request.signal,
@@ -312,7 +343,7 @@ const commandFailure = (
     kind: "failed",
     error: new ProviderAdapterError(KUNA_PROVIDER_ID, operation, {
       ...details,
-      userMessage: `kuna ${subcommand} failed${exitCode === undefined || exitCode === null ? "" : ` with exit code ${String(exitCode)}`}: ${capturedOutput?.stderr.trim().split("\n").at(-1) ?? cause.message}`,
+      userMessage: `kuna ${subcommand} failed${exitCode === undefined || exitCode === null ? "" : ` with exit code ${String(exitCode)}`}: ${capturedOutput?.stderr.trim().split("\n").at(-1) || cause.message}`,
     }),
   };
 };

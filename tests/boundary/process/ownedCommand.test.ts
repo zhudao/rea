@@ -1,6 +1,8 @@
+import { DarwinProcessOwnershipInspectionError } from "../../../src/process/DarwinProcessRunTokenReader.js";
+import { ProviderCleanupError } from "../../../src/domain/providerCleanupError.js";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { beforeAll, expect, it, vi } from "vitest";
 import {
@@ -98,6 +100,75 @@ it("collects a real owned command and verifies its exit before returning diagnos
     exitCode: 0,
     signal: null,
     stdout: { text: "observed-output", bytes: 15 },
+  });
+});
+
+it("streams stdout beyond the diagnostic budget into a sink and returns after it finishes", async () => {
+  let received = 0;
+  let finished = false;
+  const sink = new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      received += chunk.byteLength;
+      callback();
+    },
+    final(callback) {
+      // A sink still parsing after output closes delays the result.
+      setTimeout(() => {
+        finished = true;
+        callback();
+      }, 50);
+    },
+  });
+  const result = await runOwnedCommand(
+    command(
+      'process.stdout.write("a".repeat(256 * 1024)); process.stderr.write("diagnostic")',
+    ),
+    { timeoutMs: 2_000, diagnosticBytes: 1024, stdout: sink },
+  );
+  expect(finished).toBe(true);
+  expect(received).toBe(256 * 1024);
+  expect(result).toMatchObject({
+    exitCode: 0,
+    stdout: { text: "", bytes: 0 },
+    stderr: { text: "diagnostic" },
+  });
+});
+
+it("destroys a sink still finishing when the command deadline elapses", async () => {
+  const sink = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+    final(callback) {
+      setTimeout(callback, 5_000);
+    },
+  });
+  await expect(
+    runOwnedCommand(command('process.stdout.write("observed-output")'), {
+      timeoutMs: 300,
+      diagnosticBytes: 1024,
+      stdout: sink,
+    }),
+  ).rejects.toMatchObject({ reason: "timeout" });
+  expect(sink.destroyed).toBe(true);
+});
+
+it("reports a failed stdout sink as a collection failure", async () => {
+  const sink = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback(new Error("fixture sink failure"));
+    },
+  });
+  await expect(
+    runOwnedCommand(command('process.stdout.write("observed-output")'), {
+      timeoutMs: 2_000,
+      diagnosticBytes: 1024,
+      stdout: sink,
+    }),
+  ).rejects.toMatchObject({
+    reason: "process",
+    collectionFailure: true,
+    message: "stdout stream failed: fixture sink failure",
   });
 });
 
@@ -278,6 +349,10 @@ it.skipIf(process.platform === "win32")(
 
 it("cancels a real acquired process and independently releases it", async () => {
   const controller = new AbortController();
+  const callerReason = {
+    request: "active cancellation",
+    cleanup: "caller metadata",
+  };
   let pid: number | undefined;
   const result = runOwnedCommand(
     command(
@@ -290,7 +365,7 @@ it("cancels a real acquired process and independently releases it", async () => 
         const process = await spawnOwnedProviderProcess(input);
         pid = process.process.pid;
         await waitForProviderProcessReady(process.process);
-        setImmediate(() => controller.abort());
+        setImmediate(() => controller.abort(callerReason));
         return process;
       },
     },
@@ -298,6 +373,7 @@ it("cancels a real acquired process and independently releases it", async () => 
   await expect(result).rejects.toMatchObject({
     reason: "cancelled",
     cleanupFailure: null,
+    cancellation: { reason: callerReason },
   });
   if (pid === undefined) throw new Error("Process was not acquired");
   const acquiredPid = pid;
@@ -375,6 +451,9 @@ it.skipIf(process.platform === "win32").each(["cancelled", "timeout"] as const)(
           "The acquired command must retain its failed cleanup owner",
         );
       expect(failure.reason).toBe(reason);
+      if (reason === "cancelled")
+        expect(failure.cancellation?.reason).toBe(controller.signal.reason);
+      else expect(failure.cancellation).toBeUndefined();
       expect(failure.snapshot?.stdout.text).toContain("child-ready");
       expect(cleanup).toMatchObject({
         cleaned: false,
@@ -410,6 +489,7 @@ it.skipIf(process.platform === "win32").each(["cancelled", "timeout"] as const)(
 
 it("honors cancellation during cleanup after a successful command", async () => {
   const controller = new AbortController();
+  const callerReason = new Error("cancel during final process cleanup");
   await expect(
     runOwnedCommand(
       command("process.exit(0)"),
@@ -422,14 +502,18 @@ it("honors cancellation during cleanup after a successful command", async () => 
             ...launched,
             cleanup: async () => {
               const result = await cleanupOwnedProcessGroup(launched.ownership);
-              controller.abort();
+              controller.abort(callerReason);
               return result;
             },
           };
         },
       },
     ),
-  ).rejects.toMatchObject({ reason: "cancelled", cleanupFailure: null });
+  ).rejects.toMatchObject({
+    reason: "cancelled",
+    cleanupFailure: null,
+    cancellation: { reason: callerReason },
+  });
 });
 
 it("rejects oversized diagnostics even when the child exits immediately", async () => {
@@ -466,4 +550,68 @@ it("preserves original command failure together with failed cleanup resource ide
     resources: expect.arrayContaining([request.runId]),
     snapshot: { exitCode: 2 },
   });
+});
+
+it("retains the preparation owner alongside an independent command deadline", async () => {
+  const marker = new ProviderCleanupError(
+    "process-ownership",
+    ["owned helper root"],
+    { reason: "controlled cleanup failure" },
+  );
+  let preparation: DarwinProcessOwnershipInspectionError | undefined;
+  const failure = await runOwnedCommand(
+    command("process.exit(0)"),
+    { timeoutMs: 20, diagnosticBytes: 1024 },
+    {
+      launcher: async (input) => {
+        try {
+          await delay(80, undefined, { signal: input.signal });
+        } catch {
+          preparation = new DarwinProcessOwnershipInspectionError(
+            "cancelled preparation",
+            {
+              cancellation: { reason: input.signal?.reason },
+              cleanupFailure: marker,
+            },
+          );
+          throw preparation;
+        }
+        throw new Error("Unexpected completed preparation");
+      },
+    },
+  ).catch((cause: unknown) => cause);
+  expect(failure).toBeInstanceOf(OwnedCommandFailure);
+  if (!(failure instanceof OwnedCommandFailure))
+    throw new Error("Expected command deadline failure");
+  expect(failure.reason).toBe("timeout");
+  expect(failure.preparationFailure).toBe(preparation);
+  expect(failure.preparationFailure?.cleanupFailure).toBe(marker);
+});
+
+it("keeps a caller-supplied preparation error opaque when it is the exact abort reason", async () => {
+  const controller = new AbortController();
+  const marker = new ProviderCleanupError("caller", ["caller metadata"], {
+    reason: "opaque caller value",
+  });
+  const reason = new DarwinProcessOwnershipInspectionError("caller value", {
+    cleanupFailure: marker,
+  });
+  const failure = await runOwnedCommand(
+    command("process.exit(0)"),
+    { timeoutMs: 2000, diagnosticBytes: 1024 },
+    {
+      signal: controller.signal,
+      launcher: async (input) => {
+        controller.abort(reason);
+        input.signal?.throwIfAborted();
+        throw new Error("Unexpected completed preparation");
+      },
+    },
+  ).catch((cause: unknown) => cause);
+  expect(failure).toBeInstanceOf(OwnedCommandFailure);
+  if (!(failure instanceof OwnedCommandFailure))
+    throw new Error("Expected command cancellation");
+  expect(failure.reason).toBe("cancelled");
+  expect(failure.cause).toBe(reason);
+  expect(failure.preparationFailure).toBeUndefined();
 });

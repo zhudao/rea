@@ -1,5 +1,10 @@
+import {
+  probeGhidraJava,
+  type GhidraJavaObservation,
+  type GhidraJavaProbeFailure,
+} from "./GhidraJavaProbe.js";
+import type { Result } from "../domain/result.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
-import { spawnSync } from "node:child_process";
 import { constants } from "node:fs";
 import {
   accessSync,
@@ -74,15 +79,6 @@ const NATIVE_ARCHITECTURES: readonly {
 
 /** Bound installation discovery reads; larger headers remain unknown. */
 const EXECUTABLE_HEADER_PROBE_BYTES = 4096;
-
-/**
- * Bound the Java version probe so a chatty or hostile JVM cannot force an
- * unbounded in-memory capture. Well-behaved JVMs print a few kilobytes for
- * `-XshowSettings:properties`; the same 1 MiB budget used for other Java
- * listings leaves ample headroom. A probe that exceeds the budget yields no
- * observation and is reported through the existing failed-probe path.
- */
-const JAVA_PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 /** Compatibility of one present native decompiler with the inspected host. */
 type NativeDecompilerCompatibility =
@@ -202,8 +198,11 @@ interface GhidraInstallationObservation {
   readonly platform: NodeJS.Platform;
   readonly architecture: NodeJS.Architecture;
   readonly applicationPropertiesPath: string | null;
+  /** Parsed release identity, never inferred from the installation directory name. */
+  readonly configurationDirectoryName: string | null;
   readonly nativeDecompilerPath: string | null;
   readonly javaCommand: string;
+  readonly javaProbeFailure?: GhidraJavaProbeFailure;
   /** Observed java.vm.name; omitted when the probe cannot establish VM identity. */
   readonly javaVmName?: string;
   /**
@@ -250,29 +249,6 @@ export type GhidraInstallationInspection =
   | AvailableGhidraInstallation
   | UnavailableGhidraInstallation;
 
-/** Parsed identity of the JDK selected for Ghidra. */
-export interface GhidraJavaObservation {
-  readonly version: string;
-  readonly major: number;
-  readonly home: string;
-  readonly bits: number | null;
-  /** Present when Java reported a bitness value that could not be parsed exactly. */
-  readonly unparsedBits?: string;
-  readonly runtime: "jdk" | "jre";
-  readonly vmName?: string;
-  /**
-   * Observed JVM os.arch property, which Ghidra uses to select its native
-   * decompiler directory. Omitted when the probe cannot establish it.
-   */
-  readonly osArch?: string;
-  /**
-   * Observed JVM os.name property, which Ghidra uses with os.arch to select
-   * its native decompiler OS directory. Omitted when the probe cannot
-   * establish it.
-   */
-  readonly osName?: string;
-}
-
 /** A bounded executable-header probe: a small prefix plus the whole file size. */
 export interface GhidraExecutableHeaderProbe {
   /** A bounded prefix; a larger or unreadable header remains unknown. */
@@ -297,7 +273,7 @@ export interface GhidraInstallationHost {
   probeJava(
     command: string,
     environment: NodeJS.ProcessEnv,
-  ): GhidraJavaObservation | undefined;
+  ): Result<GhidraJavaObservation, GhidraJavaProbeFailure>;
   /** Resolve a PATH launcher to a validated installation without executing it. */
   discoverInstallDirOnPath?(
     environment: Readonly<NodeJS.ProcessEnv>,
@@ -313,6 +289,7 @@ interface GhidraInstallationCoordinates {
   readonly properties: GhidraApplicationProperties | undefined;
   readonly javaCommand: string;
   readonly java: GhidraJavaObservation | undefined;
+  readonly javaProbeFailure: GhidraJavaProbeFailure | undefined;
 }
 
 interface GhidraInstallationCheckContext {
@@ -347,21 +324,28 @@ export const inspectGhidraInstallation = (
     (check): check is Extract<GhidraInstallationCheck, { status: "failed" }> =>
       check.status === "failed",
   );
+  const javaObservation =
+    coordinates.java ?? coordinates.javaProbeFailure?.properties;
   const observation = {
     platform,
     architecture,
     applicationPropertiesPath: coordinates.applicationPropertiesPath,
+    configurationDirectoryName:
+      coordinates.properties?.configurationDirectoryName ?? null,
     nativeDecompilerPath: coordinates.nativeDecompilerPath,
     javaCommand: coordinates.javaCommand,
-    ...(coordinates.java?.vmName === undefined
+    ...(coordinates.javaProbeFailure === undefined
       ? {}
-      : { javaVmName: coordinates.java.vmName }),
-    ...(coordinates.java?.osArch === undefined
+      : { javaProbeFailure: coordinates.javaProbeFailure }),
+    ...(javaObservation?.vmName == null
       ? {}
-      : { javaOsArch: coordinates.java.osArch }),
-    ...(coordinates.java?.osName === undefined
+      : { javaVmName: javaObservation.vmName }),
+    ...(javaObservation?.osArch == null
       ? {}
-      : { javaOsName: coordinates.java.osName }),
+      : { javaOsArch: javaObservation.osArch }),
+    ...(javaObservation?.osName == null
+      ? {}
+      : { javaOsName: javaObservation.osName }),
     checks,
   };
   if (failed !== undefined)
@@ -371,8 +355,8 @@ export const inspectGhidraInstallation = (
       installDir: coordinates.installDir,
       analyzeHeadlessPath: coordinates.analyzeHeadlessPath,
       providerVersion: coordinates.properties?.providerVersion ?? null,
-      javaHome: coordinates.java?.home ?? options.javaHome ?? null,
-      javaVersion: coordinates.java?.version ?? null,
+      javaHome: javaObservation?.home ?? options.javaHome ?? null,
+      javaVersion: javaObservation?.version ?? null,
       rejection: { code: failed.code, reason: failed.remediation },
     };
   return availableInstallation(coordinates, observation);
@@ -462,16 +446,50 @@ const installationCoordinates = (
     applicationPropertiesPath === null
       ? undefined
       : host.readText(applicationPropertiesPath);
-  const javaCommand =
-    options.javaHome === undefined
-      ? platform === "win32"
-        ? "java.exe"
-        : "java"
-      : path.join(
-          options.javaHome,
-          "bin",
-          platform === "win32" ? "java.exe" : "java",
-        );
+  const javaCommand = (() => {
+    if (options.javaHome !== undefined)
+      return path.join(
+        options.javaHome,
+        "bin",
+        platform === "win32" ? "java.exe" : "java",
+      );
+    if (platform !== "darwin")
+      return platform === "win32" ? "java.exe" : "java";
+    // Check the caller's PATH, never a file named java in the working directory.
+    const javaOnPath = options.environment.PATH?.split(":").some(
+      (directory) =>
+        path.isAbsolute(directory) &&
+        host.executable(path.join(directory, "java")),
+    );
+    if (javaOnPath) return "java";
+    // Prefer the Homebrew prefix matching the process architecture.
+    const prefixes =
+      architecture === "arm64"
+        ? ["/opt/homebrew", "/usr/local"]
+        : ["/usr/local", "/opt/homebrew"];
+    return (
+      prefixes
+        .map((prefix) =>
+          path.join(
+            prefix,
+            "opt/openjdk/libexec/openjdk.jdk/Contents/Home/bin/java",
+          ),
+        )
+        .find((candidate) => host.executable(candidate)) ?? "java"
+    );
+  })();
+  // Relative JAVA_HOME is refused by configuration validation without execution.
+  const javaProbe =
+    options.javaHome === undefined || path.isAbsolute(options.javaHome)
+      ? host.probeJava(
+          javaCommand,
+          ghidraJavaEnvironment(
+            options.javaHome,
+            options.environment,
+            platform,
+          ),
+        )
+      : undefined;
   return {
     installDir,
     applicationPropertiesPath,
@@ -482,19 +500,9 @@ const installationCoordinates = (
         ? undefined
         : ghidraApplicationProperties(properties),
     javaCommand,
-    // The configuration check rejects a relative JAVA_HOME. Probing it would
-    // run whatever `bin/java` the current directory holds.
-    java:
-      options.javaHome === undefined || path.isAbsolute(options.javaHome)
-        ? host.probeJava(
-            javaCommand,
-            ghidraJavaEnvironment(
-              options.javaHome,
-              options.environment,
-              platform,
-            ),
-          )
-        : undefined,
+    java: javaProbe?.ok === true ? javaProbe.value : undefined,
+    javaProbeFailure:
+      javaProbe !== undefined && !javaProbe.ok ? javaProbe.error : undefined,
   };
 };
 
@@ -548,6 +556,8 @@ const installationChecks = ({
     coordinates.javaCommand,
     javaHome,
     coordinates.properties,
+    platform,
+    coordinates.javaProbeFailure,
   ),
 ];
 
@@ -585,7 +595,7 @@ const configurationCheck = (
   });
 };
 
-/** Project an installation probe into caller-visible, secret-free diagnostics. */
+/** Project an installation probe into caller-visible, bounded diagnostics. */
 export const ghidraInstallationDiagnostics = (
   inspection: GhidraInstallationInspection,
 ): Readonly<Record<string, JsonValue>> => ({
@@ -595,6 +605,26 @@ export const ghidraInstallationDiagnostics = (
   application_properties_path: inspection.applicationPropertiesPath,
   provider_version: inspection.providerVersion,
   java_command: inspection.javaCommand,
+  ...(inspection.javaProbeFailure === undefined
+    ? {}
+    : {
+        java_probe_failure: {
+          code: inspection.javaProbeFailure.code,
+          ...(inspection.javaProbeFailure.processErrorCode === undefined
+            ? {}
+            : {
+                process_error_code:
+                  inspection.javaProbeFailure.processErrorCode,
+              }),
+          detail: inspection.javaProbeFailure.detail,
+          ...(inspection.javaProbeFailure.properties === undefined
+            ? {}
+            : { properties: { ...inspection.javaProbeFailure.properties } }),
+          ...(inspection.javaProbeFailure.output === undefined
+            ? {}
+            : { output: { ...inspection.javaProbeFailure.output } }),
+        },
+      }),
   java_home: inspection.javaHome,
   java_version: inspection.javaVersion,
   java_vm_name: inspection.javaVmName ?? null,
@@ -684,8 +714,14 @@ const nativeDecompilerCheck = ({
   // Ghidra resolves the OS directory from the JVM os.name/os.arch pair, so a
   // JVM reporting a non-host os.name (for example through -Dos.name=Windows)
   // selects a different OS directory even when os.arch matches.
-  const osArch = coordinates.java?.osArch;
-  const osName = coordinates.java?.osName;
+  const osArch =
+    coordinates.java?.osArch ??
+    coordinates.javaProbeFailure?.properties?.osArch ??
+    undefined;
+  const osName =
+    coordinates.java?.osName ??
+    coordinates.javaProbeFailure?.properties?.osName ??
+    undefined;
   const selectedDirectory = jvmOsArchNativeDirectory(platform, osArch);
   const validatedDirectory = NATIVE_PLATFORMS[platform]?.[architecture];
   // Without a JVM observation the java check reports the missing runtime;
@@ -810,6 +846,8 @@ const javaCheck = (
   command: string,
   configuredHome: string | undefined,
   properties: GhidraApplicationProperties | undefined,
+  platform: NodeJS.Platform,
+  failure: GhidraJavaProbeFailure | undefined,
 ): GhidraInstallationCheck => {
   const requirement = ghidraJavaRequirement(properties);
   const range = ghidraJavaRangeLabel(requirement);
@@ -832,8 +870,8 @@ const javaCheck = (
   const detail =
     observation === undefined
       ? requirement.unresolved === null
-        ? command
-        : `${command}; ${requirement.unresolved}`
+        ? (failure?.detail ?? `${command}: Java probe was not attempted`)
+        : `${failure?.detail ?? command}; ${requirement.unresolved}`
       : `${observation.version}; ${bitness}; ${observation.runtime === "jdk" ? "JDK" : "runtime only"}; ${observation.home}; accepted ${range}`;
   return installationCheck({
     name: "java",
@@ -842,12 +880,12 @@ const javaCheck = (
       requirement.unresolved !== null
         ? "version_unresolved"
         : observation === undefined
-          ? "runtime_missing"
+          ? (failure?.code ?? "version_unresolved")
           : knownMismatch
             ? "unsupported_version"
             : "version_unresolved",
     detail,
-    remediation: javaRemediation(requirement, configuredHome, range),
+    remediation: javaRemediation(requirement, configuredHome, range, platform),
   });
 };
 
@@ -855,11 +893,12 @@ const javaRemediation = (
   requirement: GhidraJavaRequirement,
   configuredHome: string | undefined,
   range: string,
+  platform: NodeJS.Platform,
 ): string => {
   if (requirement.unresolved !== null)
     return `The Ghidra installation's Java bounds could not be read (${requirement.unresolved}). Install a 64-bit full JDK inside the declared application.java.min and application.java.max.`;
   return configuredHome === undefined
-    ? `Install ${range}, or set JAVA_HOME before starting REA.`
+    ? `Select ${range} on PATH, or set JAVA_HOME to its installation root before starting REA.${platform === "darwin" ? " Homebrew OpenJDK can be keg-only: set JAVA_HOME to the selected formula's libexec/openjdk.jdk/Contents/Home (for example /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home or /usr/local/opt/openjdk/libexec/openjdk.jdk/Contents/Home). The installed JDK must satisfy the declared Ghidra Java bounds." : ""}`
     : `Update JAVA_HOME to the root of ${range} installation.`;
 };
 
@@ -905,72 +944,7 @@ const systemGhidraInstallationHost = (): GhidraInstallationHost => ({
       return false;
     }
   },
-  probeJava(command, environment) {
-    const observed = spawnSync(
-      command,
-      [
-        "-Dstdout.encoding=UTF-8",
-        "-Dstderr.encoding=UTF-8",
-        // JDK 17/18 use the legacy names; JDK 19+ use the names above.
-        "-Dsun.stdout.encoding=UTF-8",
-        "-Dsun.stderr.encoding=UTF-8",
-        "-XX:-UsePerfData",
-        "-XshowSettings:properties",
-        "-version",
-      ],
-      {
-        encoding: "utf8",
-        env: environment,
-        timeout: 5_000,
-        maxBuffer: JAVA_PROBE_MAX_OUTPUT_BYTES,
-        windowsHide: true,
-      },
-    );
-    if (observed.error !== undefined || observed.status !== 0) return undefined;
-    const output = `${observed.stdout ?? ""}\n${observed.stderr ?? ""}`;
-    const version = javaProperty(output, "java.version");
-    const home = javaProperty(output, "java.home");
-    const vmName = javaProperty(output, "java.vm.name");
-    const osArch = javaProperty(output, "os.arch");
-    const osName = javaProperty(output, "os.name");
-    const reportedBits = javaProperty(output, "sun.arch.data.model");
-    const parsedBits =
-      reportedBits !== null && /^\d+$/.test(reportedBits)
-        ? Number(reportedBits)
-        : null;
-    const bits =
-      parsedBits !== null && Number.isSafeInteger(parsedBits)
-        ? parsedBits
-        : null;
-    if (
-      version === null ||
-      version.length === 0 ||
-      home === null ||
-      home.length === 0
-    )
-      return undefined;
-    return {
-      version,
-      major: javaMajor(version),
-      home,
-      ...(vmName === null ? {} : { vmName }),
-      ...(osArch === null ? {} : { osArch }),
-      ...(osName === null ? {} : { osName }),
-      bits,
-      ...(reportedBits === null || bits !== null
-        ? {}
-        : { unparsedBits: reportedBits }),
-      runtime: executablePath(
-        (process.platform === "win32" ? win32 : posix).join(
-          home,
-          "bin",
-          process.platform === "win32" ? "javac.exe" : "javac",
-        ),
-      )
-        ? "jdk"
-        : "jre",
-    };
-  },
+  probeJava: probeGhidraJava,
   discoverInstallDirOnPath: discoverGhidraInstallationOnPath,
 });
 
@@ -1026,16 +1000,4 @@ const executablePath = (path: string): boolean => {
     void cause;
     return false;
   }
-};
-
-const javaProperty = (output: string, name: string): string | null =>
-  new RegExp(
-    `^[ \\t]*${name.replaceAll(".", "\\.")}[ \\t]*=[ \\t]*([^\\r\\n]*?)[ \\t]*\\r?$`,
-    "mu",
-  ).exec(output)?.[1] ?? null;
-
-const javaMajor = (version: string): number => {
-  const first = Number.parseInt(version.split(".")[0] ?? "0", 10);
-  if (first !== 1) return first;
-  return Number.parseInt(version.split(".")[1] ?? "0", 10);
 };

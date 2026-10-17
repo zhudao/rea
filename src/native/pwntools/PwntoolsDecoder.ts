@@ -1,4 +1,9 @@
 import {
+  bindArtifactFileCleanup,
+  ArtifactFileCleanupFailure,
+  artifactFileCancellationCause,
+} from "../../artifacts/ArtifactFileOperation.js";
+import {
   pwntoolsDecoderFailure,
   pwntoolsUnavailable,
   capturedPwntoolsOutput,
@@ -299,9 +304,6 @@ export class PwntoolsDecoder<
             requestPath,
           ],
           cwd: root.path,
-          // Caller-selected Python launchers can exec through prlimit or a
-          // shell wrapper. Keep parent/group/run-token ownership across exec.
-          expectedCommand: null,
           runId: `rea-artifact-decoder-${randomUUID()}`,
           hostEnvironment: {
             ...this.environment,
@@ -325,16 +327,40 @@ export class PwntoolsDecoder<
         );
         reply = replySchema.parse(JSON.parse(file.bytes.toString("utf8")));
       } catch (cause: unknown) {
-        if (options?.signal?.aborted)
-          throw new AnalysisCancelledError(OPERATION, {
-            cause,
+        if (
+          cause instanceof ArtifactReaderFailure &&
+          (cause.reason === "cancelled" ||
+            (cause instanceof ArtifactFileCleanupFailure &&
+              cause.fileCleanupFailure.outcome.kind === "completed" &&
+              options?.signal?.aborted))
+        ) {
+          const error = new AnalysisCancelledError(OPERATION, {
+            cause:
+              cause.reason === "cancelled"
+                ? artifactFileCancellationCause(cause)
+                : options?.signal?.reason,
             capturedOutput,
+            ...(cause instanceof ArtifactReaderFailure &&
+            cause.cleanup !== undefined
+              ? { cleanup: cause.cleanup }
+              : {}),
           });
-        throw new AnalysisOutputError(
+          bindArtifactFileCleanup(cause, error);
+          throw error;
+        }
+        const error = new AnalysisOutputError(
           OPERATION,
           `Owned pwntools decoder reply failed for ${input.path}: ${cause instanceof z.ZodError ? cause.issues[0]?.message + " at " + (cause.issues[0]?.path.map(String).join(".") ?? "root") : cause instanceof Error ? cause.message : String(cause)}`,
-          { cause, capturedOutput },
+          {
+            cause,
+            capturedOutput,
+            ...(cause instanceof ArtifactReaderFailure
+              ? { cleanup: cause.cleanup }
+              : {}),
+          },
         );
+        bindArtifactFileCleanup(cause, error);
+        throw error;
       }
       if (!reply.ok) {
         if (reply.reason === "unsupported-target")
@@ -478,7 +504,13 @@ export class PwntoolsDecoder<
     try {
       outcome = ok(
         await runOwnedCommand(
-          spawn,
+          {
+            ...spawn,
+            // Every decoder stage can replace its launcher through exec,
+            // including the optional Python-to-GDB handoff. Preserve explicit
+            // pins; otherwise keep parent/group/run-token proof across exec.
+            expectedCommand: spawn.expectedCommand ?? null,
+          },
           {
             timeoutMs: PWNTOOLS_LIMITS.timeoutMs,
             diagnosticBytes: PWNTOOLS_LIMITS.diagnosticBytes,

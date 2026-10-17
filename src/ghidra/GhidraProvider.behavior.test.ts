@@ -1,3 +1,5 @@
+import { ok as javaProbeOk } from "../domain/result.js";
+import type { GhidraJavaObservation } from "./GhidraJavaProbe.js";
 import type { GhidraSeedReport } from "./GhidraAnalysisSeeds.js";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -50,16 +52,17 @@ const installationHost = (
   architecture: "x64",
   readText: () => "application.version=12.1.4\napplication.java.min=21\n",
   executable: () => true,
-  probeJava: () => ({
-    osArch: "amd64",
-    osName: platform === "win32" ? "Windows 11" : "Linux",
-    version: "21.0.11",
-    major: 21,
-    home: "/usr/lib/jvm/jdk-21",
-    bits: 64,
-    runtime: "jdk",
-    vmName: "OpenJDK 64-Bit Server VM",
-  }),
+  probeJava: () =>
+    javaProbeOk<GhidraJavaObservation>({
+      osArch: "amd64",
+      osName: platform === "win32" ? "Windows 11" : "Linux",
+      version: "21.0.11",
+      major: 21,
+      home: "/usr/lib/jvm/jdk-21",
+      bits: 64,
+      runtime: "jdk",
+      vmName: "OpenJDK 64-Bit Server VM",
+    }),
 });
 
 const provider = (
@@ -149,6 +152,30 @@ it.each([
   },
 );
 
+it("carries the inspected release identity into the production launcher", async () => {
+  const launchers: GhidraHeadlessLauncher[] = [];
+  const ghidra = provider(
+    {
+      ...installationHost(),
+      readText: () =>
+        "application.version=12.1.4\napplication.release.name=PUBLIC\napplication.java.min=21\n",
+    },
+    (options) => {
+      launchers.push(options.launcher as GhidraHeadlessLauncher);
+      return {
+        start: () => Promise.resolve(ok(sessionInfo())),
+        callTool: () => Promise.resolve(ok(null)),
+        close: () => Promise.resolve(ok(null)),
+      };
+    },
+  );
+  const client = await createElfClient(ghidra);
+  expect(launchers[0]?.options).toMatchObject({
+    configurationDirectoryName: "ghidra_12.1.4_PUBLIC",
+  });
+  await client.close();
+});
+
 describe("Ghidra provider", () => {
   it("commits DOS loader and real-mode language while retaining the CPU family", async () => {
     const ghidra = provider();
@@ -184,7 +211,7 @@ describe("Ghidra provider", () => {
       ...installationHost(),
       probeJava: () => {
         probeCount += 1;
-        return {
+        return javaProbeOk<GhidraJavaObservation>({
           osArch: "amd64",
           osName: "Linux",
           version: "21.0.11",
@@ -192,7 +219,7 @@ describe("Ghidra provider", () => {
           home: "/usr/lib/jvm/jdk-21",
           bits: 64,
           runtime: "jdk",
-        };
+        });
       },
     };
     const ghidra = provider(host);
@@ -337,6 +364,37 @@ describe("Ghidra raw-binary profile", () => {
     );
     const windows = provider(installationHost("win32"));
     expect(windows.inspectTargetSupport(target).status).toBe("unsupported");
+  });
+  it("binds raw m68k to the big-endian 68000 language outside Windows P0", async () => {
+    const target: BinaryTarget = {
+      path: "/tmp/m68k.bin",
+      sha256: "a".repeat(64),
+      kind: "executable",
+      format: "raw-binary",
+      architecture: "m68k",
+      availableArchitectures: ["m68k"],
+      entryPoint: "0x1000",
+      entryPointSource: "0x00001000",
+    };
+    const ghidra = provider();
+    expect(ghidra.inspectTargetSupport(target).status).toBe("supported");
+    const resolved = await ghidra.resolveAnalysisProfile(target);
+    if (!resolved.ok) throw resolved.error;
+    expect(resolved.value.profile?.parameters).toMatchObject({
+      target_format: "raw-binary",
+      architecture: "m68k",
+      loader: "BinaryLoader",
+      language_id: "68000:BE:32:default",
+      compiler_spec_id: "default",
+      language_selection: "caller-supplied-v1",
+      entry_point: "0x1000",
+    });
+    expect(
+      provider(installationHost("win32")).inspectTargetSupport(target),
+    ).toMatchObject({
+      status: "unsupported",
+      code: "target_format_unsupported",
+    });
   });
 });
 
@@ -2237,15 +2295,16 @@ describe("compatible Ghidra builds", () => {
         ...installationHost(),
         readText: () =>
           "application.version=12.1.2\napplication.java.min=21\napplication.java.max=\n",
-        probeJava: () => ({
-          osArch: "amd64",
-          osName: "Linux",
-          version: "27",
-          major: 27,
-          home: "/usr/lib/jvm/java-27-openjdk",
-          bits: 64,
-          runtime: "jdk",
-        }),
+        probeJava: () =>
+          javaProbeOk<GhidraJavaObservation>({
+            osArch: "amd64",
+            osName: "Linux",
+            version: "27",
+            major: 27,
+            home: "/usr/lib/jvm/java-27-openjdk",
+            bits: 64,
+            runtime: "jdk",
+          }),
       },
       () => ({
         start: () =>
@@ -2341,6 +2400,64 @@ it("projects Ghidra startup failure and its incomplete cleanup together", async 
         },
       },
     });
+});
+
+describe("Ghidra deadline guidance", () => {
+  const timedOut = async (phase: "start" | "request", message: string) => {
+    const failure = new GhidraSessionError(
+      "timeout",
+      message,
+      { failure_kind: "timeout" },
+      { timeoutMs: 250 },
+    );
+    const ghidra = provider(installationHost(), () => ({
+      start: async () => (phase === "start" ? err(failure) : ok(sessionInfo())),
+      callTool: async () => err(failure),
+      close: async () => ok(null),
+    }));
+    const target = executableTarget("elf", "x86_64");
+    const profile = await ghidra.resolveAnalysisProfile(target);
+    if (!profile.ok || profile.value.profile === null)
+      throw new Error("Expected Ghidra analysis profile");
+    const result = await ghidra
+      .createClient(target, profile.value.profile)
+      .execute("list_documents", {});
+    if (result.ok) throw new Error("Expected a Ghidra timeout");
+    return projectAnalysisError(result.error);
+  };
+
+  it("names the startup deadline setting and its value when startup times out", async () => {
+    const projected = await timedOut(
+      "start",
+      "Ghidra startup deadline elapsed",
+    );
+    expect(projected).toMatchObject({
+      code: "provider_timeout",
+      details: { timeout_ms: 250 },
+    });
+    expect(projected.message).toContain(
+      "250 ms startup deadline (REA_GHIDRA_STARTUP_TIMEOUT_MS)",
+    );
+    expect(projected.remediation.action).toContain(
+      "REA_GHIDRA_STARTUP_TIMEOUT_MS above 250",
+    );
+    expect(projected.remediation.action).toContain(
+      "REA_GHIDRA_DISABLED_ANALYZERS",
+    );
+    expect(projected.remediation.action).not.toContain("rea doctor");
+  });
+
+  it("keeps generic guidance for a bridge request deadline", async () => {
+    const projected = await timedOut(
+      "request",
+      "Ghidra bridge request timed out",
+    );
+    expect(projected.code).toBe("provider_timeout");
+    expect(projected.message).not.toContain("REA_GHIDRA_STARTUP_TIMEOUT_MS");
+    expect(projected.remediation.action).not.toContain(
+      "REA_GHIDRA_STARTUP_TIMEOUT_MS",
+    );
+  });
 });
 
 describe("Ghidra analysis seeds and configured language", () => {

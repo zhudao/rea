@@ -5,6 +5,20 @@ import { lstat, open, stat, type FileHandle } from "node:fs/promises";
 
 import { OwnedFileHandle } from "./OwnedFileHandle.js";
 
+/** Cancellation observed at a file operation's explicit checkpoint. */
+export class RegularFileOperationCancelled extends Error {
+  readonly _tag = "RegularFileOperationCancelled";
+  constructor(readonly reason: unknown) {
+    super("Regular file operation cancelled", { cause: reason });
+    this.name = this._tag;
+  }
+}
+
+export const assertRegularFileActive = (signal?: AbortSignal): void => {
+  if (signal?.aborted === true)
+    throw new RegularFileOperationCancelled(signal.reason);
+};
+
 /** Identifies a selected path that cannot be read as one regular file. */
 export class NonRegularFileReadError extends Error {
   readonly code: "EISDIR" | "ENOTFILE";
@@ -19,38 +33,21 @@ export class NonRegularFileReadError extends Error {
   }
 }
 
-/** One regular-file operation failed while its opened descriptor could not be confirmed closed. */
-export class OwnedRegularFileCleanupFailure extends Error {
+/** Admission failed and the opened descriptor could not be confirmed closed. */
+export class RegularFileAdmissionFailure extends Error {
   override readonly cause: unknown;
 
   constructor(
     readonly path: string,
-    cause: unknown,
+    admissionCause: unknown,
     readonly cleanupCause: unknown,
     readonly owner: OwnedFileHandle,
-    message: string,
-  ) {
-    super(message, { cause });
-    this.cause = cause;
-  }
-}
-
-/** Admission failed and the opened descriptor could not be confirmed closed. */
-export class RegularFileAdmissionFailure extends OwnedRegularFileCleanupFailure {
-  constructor(
-    path: string,
-    admissionCause: unknown,
-    cleanupCause: unknown,
-    owner: OwnedFileHandle,
   ) {
     super(
-      path,
-      admissionCause,
-      cleanupCause,
-      owner,
       `Selected input failed admission and its descriptor close failed: ${path}`,
     );
     this.name = "RegularFileAdmissionFailure";
+    this.cause = admissionCause;
   }
 }
 
@@ -77,7 +74,7 @@ export const openRegularFile = async (
     readonly signal?: AbortSignal | undefined;
   },
 ): Promise<FileHandle> => {
-  options.signal?.throwIfAborted();
+  assertRegularFileActive(options.signal);
   const handle = await open(
     path,
     constants.O_RDONLY |
@@ -91,26 +88,24 @@ export const openRegularFile = async (
       cause,
     );
     if (nonRegular === undefined) throw cause;
-    // Cancellation during the metadata probe outranks the reclassification.
-    options.signal?.throwIfAborted();
     throw nonRegular;
   });
   const owner = new OwnedFileHandle(handle);
   try {
-    options.signal?.throwIfAborted();
+    assertRegularFileActive(options.signal);
     const metadata = await handle.stat();
-    options.signal?.throwIfAborted();
     if (!metadata.isFile())
       throw new NonRegularFileReadError(path, metadata.isDirectory());
+    assertRegularFileActive(options.signal);
     // O_NOFOLLOW is unavailable on Windows. Recheck the name only on hosts
     // where open could have followed a symlink, while the descriptor is owned.
     if (options.symlinks === "reject" && (constants.O_NOFOLLOW ?? 0) === 0) {
       const named = await lstat(path);
-      options.signal?.throwIfAborted();
       if (named.isSymbolicLink())
         throw new NonRegularFileReadError(path, false);
       if (!sameRegularFileState(metadata, named))
         throw new RegularFileChangedError(path);
+      assertRegularFileActive(options.signal);
     }
     return handle;
   } catch (cause: unknown) {

@@ -2,103 +2,93 @@ import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 
 import {
-  OwnedRegularFileCleanupFailure,
-  openRegularFile,
+  withOwnedRegularFile,
+  RegularFileCancelled,
+  RegularFileCleanupFailure,
+} from "./OwnedRegularFile.js";
+import {
   RegularFileChangedError,
+  RegularFileOperationCancelled,
+  assertRegularFileActive,
   sameRegularFileState,
 } from "./RegularFile.js";
-import { OwnedFileHandle } from "./OwnedFileHandle.js";
+import type { OwnedFileHandle } from "./OwnedFileHandle.js";
 
-export type StableFileHashResult = {
-  readonly sha256: string;
-  readonly bytes: number;
-};
+export interface StableFileHashOptions {
+  readonly signal?: AbortSignal;
+  readonly retainFailedClose: (owner: OwnedFileHandle) => void;
+}
 
-/** Hashing finished or failed, but the owned descriptor close was rejected. */
-export class StableFileHashCleanupFailure extends OwnedRegularFileCleanupFailure {
+/** Physical hash admission/read failure with no outstanding descriptor cleanup. */
+export class StableFileHashFailure extends Error {
+  readonly _tag = "StableFileHashFailure";
   constructor(
-    path: string,
-    primaryCause: unknown,
-    readonly hasPrimaryCause: boolean,
-    cleanupCause: unknown,
-    owner: OwnedFileHandle,
-    readonly completedHash: StableFileHashResult | undefined,
+    readonly path: string,
+    override readonly cause: unknown,
   ) {
     super(
-      path,
-      hasPrimaryCause ? primaryCause : cleanupCause,
-      cleanupCause,
-      owner,
-      `Stable file hashing could not confirm descriptor close: ${path}`,
+      `Could not hash ${path}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
     );
-    this.name = "StableFileHashCleanupFailure";
+    this.name = this._tag;
   }
 }
+
+/** Read the producing boundary's physical failure without guessing from signal state. */
+export const stableFileHashCause = (cause: unknown): unknown =>
+  cause instanceof StableFileHashFailure ? cause.cause : cause;
 
 /** Hash one regular file from its admitted descriptor and verify its path state. */
 export const hashStableFile = async (
   path: string,
-  signal?: AbortSignal,
-): Promise<StableFileHashResult> => {
-  const handle = await openRegularFile(path, {
-    symlinks: "follow",
-    signal,
-  });
-  const owner = new OwnedFileHandle(handle);
-  let primaryCause: unknown;
-  let hasPrimaryCause = false;
-  let completedHash: StableFileHashResult | undefined;
+  options: StableFileHashOptions,
+): Promise<{ readonly sha256: string; readonly bytes: number }> => {
   try {
-    const initial = await handle.stat();
-    if (!Number.isSafeInteger(initial.size) || initial.size < 0)
-      throw new RangeError(
-        `Regular file size cannot be represented safely: ${path}`,
-      );
-    const hash = createHash("sha256");
-    const chunk = Buffer.allocUnsafe(64 * 1024);
-    let position = 0;
-    while (position <= initial.size) {
-      signal?.throwIfAborted();
-      const length = Math.min(chunk.length, initial.size - position + 1);
-      if (length <= 0) break;
-      const read = await handle.read(chunk, 0, length, position);
-      signal?.throwIfAborted();
-      if (read.bytesRead === 0) break;
-      hash.update(chunk.subarray(0, read.bytesRead));
-      position += read.bytesRead;
-      if (position > initial.size) throw new RegularFileChangedError(path);
-    }
-    signal?.throwIfAborted();
-    const [opened, currentPath] = await Promise.all([
-      handle.stat(),
-      stat(path),
-    ]);
-    signal?.throwIfAborted();
-    if (
-      position !== initial.size ||
-      !sameRegularFileState(initial, opened) ||
-      !sameRegularFileState(initial, currentPath)
-    )
-      throw new RegularFileChangedError(path);
-    completedHash = { sha256: hash.digest("hex"), bytes: position };
+    return await withOwnedRegularFile(path, options, async (handle) => {
+      const initial = await handle.stat();
+      if (!Number.isSafeInteger(initial.size) || initial.size < 0)
+        throw new RangeError(
+          `Regular file size cannot be represented safely: ${path}`,
+        );
+      const hash = createHash("sha256");
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      while (position <= initial.size) {
+        assertRegularFileActive(options.signal);
+        const length = Math.min(chunk.length, initial.size - position + 1);
+        if (length <= 0) break;
+        const read = await handle.read(chunk, 0, length, position);
+        if (
+          position + read.bytesRead > initial.size ||
+          (read.bytesRead === 0 && position < initial.size)
+        )
+          throw new RegularFileChangedError(path);
+        assertRegularFileActive(options.signal);
+        if (read.bytesRead === 0) break;
+        hash.update(chunk.subarray(0, read.bytesRead));
+        position += read.bytesRead;
+      }
+      assertRegularFileActive(options.signal);
+      const [opened, currentPath] = await Promise.all([
+        handle.stat(),
+        stat(path),
+      ]);
+      if (
+        position !== initial.size ||
+        !sameRegularFileState(initial, opened) ||
+        !sameRegularFileState(initial, currentPath)
+      )
+        throw new RegularFileChangedError(path);
+      assertRegularFileActive(options.signal);
+      return { sha256: hash.digest("hex"), bytes: position };
+    });
   } catch (cause: unknown) {
-    primaryCause = cause;
-    hasPrimaryCause = true;
+    if (
+      cause instanceof RegularFileCleanupFailure ||
+      cause instanceof RegularFileCancelled ||
+      cause instanceof RegularFileOperationCancelled
+    )
+      throw cause;
+    throw new StableFileHashFailure(path, cause);
   }
-  try {
-    await owner.close();
-  } catch (cleanupCause: unknown) {
-    throw new StableFileHashCleanupFailure(
-      path,
-      primaryCause,
-      hasPrimaryCause,
-      cleanupCause,
-      owner,
-      completedHash,
-    );
-  }
-  if (hasPrimaryCause) throw primaryCause;
-  if (completedHash === undefined)
-    throw new Error("Stable file hashing completed without a digest");
-  return completedHash;
 };
