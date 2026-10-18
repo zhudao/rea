@@ -1,28 +1,78 @@
-import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import type {
+  AnalysisError,
+  AnalysisCleanupResourceOwner,
+} from "../domain/analysisErrorBase.js";
 
 /** Link one resource's confirmed release to its originating analysis error. */
 export class AnalysisCleanupLease {
   #released = false;
+  #releasePromise: Promise<void> | undefined;
   #errors: WeakRef<AnalysisError>[] = [];
   readonly #groups = new Set<AnalysisCleanupLeaseGroup>();
 
-  readonly cleanupResources: readonly string[] | undefined;
+  /** Whether this exact owner has confirmed release. */
+  get released(): boolean {
+    return this.#released;
+  }
+
+  readonly #resourceOwner: AnalysisCleanupResourceOwner | undefined;
+  readonly #resources: readonly string[] | undefined;
+
+  get cleanupResources(): readonly string[] | undefined {
+    return this.#resourceOwner === undefined
+      ? this.#resources
+      : this.#resourceOwner.cleanupResources;
+  }
+
+  /** Adopt exact close authority while retaining its live labels across retries. */
+  static forCloseOwner(
+    owner: {
+      close(): Promise<void>;
+      readonly cleanupResources?: readonly string[] | undefined;
+    },
+    resource: string,
+  ): AnalysisCleanupLease {
+    return new AnalysisCleanupLease(
+      () => owner.close(),
+      !("cleanupResources" in owner)
+        ? [resource]
+        : {
+            get cleanupResources() {
+              return owner.cleanupResources;
+            },
+          },
+    );
+  }
 
   constructor(
     private readonly cleanup: () => Promise<void>,
-    resources?: readonly string[],
+    resources?: readonly string[] | AnalysisCleanupResourceOwner,
   ) {
-    this.cleanupResources =
-      resources === undefined ? undefined : [...resources];
+    if (resources !== undefined && "cleanupResources" in resources) {
+      this.#resourceOwner = resources;
+      this.#resources = undefined;
+    } else {
+      this.#resourceOwner = undefined;
+      this.#resources = resources === undefined ? undefined : [...resources];
+    }
   }
 
-  async release(): Promise<void> {
-    if (this.#released) return;
-    await this.cleanup();
-    this.#released = true;
-    this.#resolveBoundErrors();
-    for (const group of this.#groups) group.ownerReleased(this);
-    this.#groups.clear();
+  release(): Promise<void> {
+    if (this.#released) return Promise.resolve();
+    if (this.#releasePromise !== undefined) return this.#releasePromise;
+    const attempt = Promise.resolve()
+      .then(async () => {
+        await this.cleanup();
+        this.#released = true;
+        this.#resolveBoundErrors();
+        for (const group of this.#groups) group.ownerReleased(this);
+        this.#groups.clear();
+      })
+      .finally(() => {
+        if (this.#releasePromise === attempt) this.#releasePromise = undefined;
+      });
+    this.#releasePromise = attempt;
+    return attempt;
   }
 
   /** Binding can follow a concurrent retry that already confirmed release. */

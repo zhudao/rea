@@ -1,3 +1,4 @@
+import { javaScriptSemanticUnknownOmissionsSchema } from "../../domain/javascript/javascriptSemanticGraphSchemas.js";
 import { z } from "zod";
 import { digestSchema } from "../../domain/digests.js";
 import type { JavaScriptStaticAnalysis } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
@@ -343,6 +344,7 @@ export const javaScriptWorkerStaticAnalysisSchema = z
           "cache-storage",
           "sqlite",
         ]),
+        interpretation: z.literal("candidate").exactOptional(),
         name: z.string().nullable(),
         mechanism: z.string(),
       }),
@@ -653,8 +655,10 @@ export const javaScriptWorkerGraphRecordSchema = z.discriminatedUnion("kind", [
 
 /** Portable per-file header, before any graph binding or immutable proof. */
 export const javaScriptWorkerProjectionHeaderSchema = z.strictObject({
+  omittedUnknownOccurrences:
+    javaScriptSemanticUnknownOmissionsSchema.exactOptional(),
   roots: z.array(javaScriptSemanticNodeSchema.shape.node_id),
-  truncated: z.boolean(),
+  nodesTruncated: z.boolean(),
 });
 
 /** Module facts are transferred individually to avoid a whole-IR JSON string. */

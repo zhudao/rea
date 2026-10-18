@@ -706,6 +706,50 @@ exit 1`,
   expect(result.total_bytes).toBe(34);
 });
 
+it("marks coverage partial when `pkg=null` leaves permissions unknown", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:package": `Packages:
+  Package [com.example] (abcdef):
+    userId=10234
+    pkg=null
+    versionCode=45 minSdk=24 targetSdk=34
+    codePath=/data/app/com.example
+`,
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_package",
+    input: { serial: "emulator-5554", package: "com.example" },
+  });
+  expect(result).toMatchObject({
+    requested_permissions_count: null,
+    coverage: "partial",
+  });
+});
+
+it("keeps permission counts unknown when package state is not established", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:package": `Packages:
+  Package [com.example] (abcdef):
+    appId=10234
+    codePath=/data/app/com.example
+    versionCode=45 minSdk=24 targetSdk=34
+`,
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_package",
+    input: { serial: "emulator-5554", package: "com.example" },
+  });
+  expect(result).toMatchObject({
+    version_code: "45",
+    requested_permissions_count: null,
+    coverage: "partial",
+  });
+});
+
 it("projects package details from dumpsys package output", async () => {
   const { binary } = await writeAdbStub(
     shellStub({
@@ -749,6 +793,7 @@ it.each(["9007199254740993", "-4294967296"])(
       shellStub({
         "dumpsys:package": `Packages:
   Package [com.example] (abcdef):
+    pkg=Package{abcdef com.example}
     versionCode=${versionCode} minSdk=24 targetSdk=34
 `,
       }),
@@ -759,6 +804,7 @@ it.each(["9007199254740993", "-4294967296"])(
     });
     expect(result).toMatchObject({
       version_code: versionCode,
+      requested_permissions_count: 0,
       coverage: "complete",
     });
   },
@@ -1515,7 +1561,7 @@ exit 1`,
 it("uninstalls a package and reports the device's refusal for absent ones", async () => {
   const { binary } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
-if [ "$1" = "-s" ] && [ "$3" = "uninstall" ]; then printf 'Success\\n'; exit 0; fi
+if [ "$#" = 8 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "pm" ] && [ "$5" = "uninstall" ] && [ "$6" = "--user" ] && [ "$7" = 0 ]; then printf 'Success\\n'; exit 0; fi
 exit 1`,
   );
   const removed = await evidenceResult(providerOver(binary), {
@@ -1526,7 +1572,7 @@ exit 1`,
 
   const { binary: refusing } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
-if [ "$1" = "-s" ] && [ "$3" = "uninstall" ]; then printf 'Failure [not installed for 0]\\n'; exit 0; fi
+if [ "$#" = 8 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "pm" ] && [ "$5" = "uninstall" ] && [ "$6" = "--user" ] && [ "$7" = 0 ]; then printf 'Failure [not installed for 0]\\n'; exit 0; fi
 exit 1`,
   );
   const projected = await refusedBy(providerOver(refusing), {
@@ -1570,7 +1616,7 @@ exit 1`,
 it("preserves the device's uninstall refusal when adb exits nonzero", async () => {
   const { binary } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
-if [ "$1" = "-s" ] && [ "$3" = "uninstall" ]; then printf 'Failure [not installed for 0]\\n'; exit 1; fi
+if [ "$#" = 8 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "pm" ] && [ "$5" = "uninstall" ] && [ "$6" = "--user" ] && [ "$7" = 0 ]; then printf 'Failure [not installed for 0]\\n'; exit 1; fi
 exit 1`,
   );
   const projected = await refusedBy(providerOver(binary), {

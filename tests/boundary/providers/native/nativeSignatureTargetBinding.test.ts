@@ -13,7 +13,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
+import { signatureInspectionFixture } from "../../../fixtures/nativeCommands.js";
+import { resolvedAnalysisError } from "../../../../src/domain/analysisErrorBase.js";
 import { NativeMacOSProvider } from "../../../../src/native/NativeMacOSProvider.js";
 import { ArtifactResourceScope } from "../../../../src/artifacts/ArtifactResourceScope.js";
 import {
@@ -26,7 +28,7 @@ import {
   type NativeCommandRunner,
 } from "../../../../src/native/CommandRunner.js";
 import { inspectSignatureSchema } from "../../../../src/domain/native/nativeInspection.js";
-import { err } from "../../../../src/domain/result.js";
+import { err, ok } from "../../../../src/domain/result.js";
 import { projectAnalysisError } from "../../../../src/domain/analysisErrorProjection.js";
 import {
   NativeFixtureRunner,
@@ -70,6 +72,47 @@ describe("native signature target identity", () => {
       signed: true,
       identifier: "com.example.fixture",
     });
+  });
+
+  it("projects typed plist scalars from a controlled entitlement response", async () => {
+    const { path, target } = await fixture();
+    const replay = new NativeFixtureRunner();
+    const xml = `<?xml version="1.0"?><plist><dict>
+<key>positive</key><real>+infinity</real>
+<key>negative</key><real>-inf</real>
+<key>nan</key><real>nan</real>
+<key>integer</key><integer>9007199254740993</integer>
+<key>date</key><date>2001-01-01T00:00:00Z</date>
+<key>data</key><data>AQID</data><key>control</key><true/>
+</dict></plist>`;
+    const runner: NativeCommandRunner = {
+      run(tool, args) {
+        return args.includes("--entitlements")
+          ? new NativeFixtureRunner({ codesign: xml }).run(tool, args)
+          : replay.run(tool, args);
+      },
+    };
+    const result = await new NativeMacOSProvider({}, runner, "darwin")
+      .createClient(target)
+      .execute("inspect_signature", {});
+    if (!result.ok) throw result.error;
+    const signature = inspectSignatureSchema.parse(result.value.result);
+    expect(signature.entitlements).toEqual({
+      positive: { $plist_type: "real", value: "+infinity" },
+      negative: { $plist_type: "real", value: "-infinity" },
+      nan: { $plist_type: "real", value: "nan" },
+      integer: { $plist_type: "integer", decimal: "9007199254740993" },
+      date: { $plist_type: "date", iso8601: "2001-01-01T00:00:00.000Z" },
+      data: { $plist_type: "data", base64: "AQID" },
+      control: true,
+    });
+    expect(signature.limitations).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Entitlements: 3 non-finite real value(s)"),
+        expect.stringContaining("unambiguous integer value(s)"),
+      ]),
+    );
+    expect(await readFile(path, "utf8")).toBe(CONTENT);
   });
 
   it.each(["changed", "missing", "directory", "symlink"] as const)(
@@ -297,7 +340,7 @@ it("returns typed cancellation at binding entry and final verification", async (
         ok: false,
         error: { _tag: "AnalysisCancelledError" },
       });
-      return result;
+      return result.ok ? ok(signatureInspectionFixture()) : result;
     },
   );
 });
@@ -359,7 +402,8 @@ it("copies and hashes the same bytes across multiple snapshot chunks", async () 
     new ArtifactResourceScope(),
     async (binding) => {
       expect(await readFile(binding.snapshotPath)).toEqual(bytes);
-      return verifySignatureTarget(target, binding);
+      const verified = await verifySignatureTarget(target, binding);
+      return verified.ok ? ok(signatureInspectionFixture()) : verified;
     },
   );
 });
@@ -450,3 +494,57 @@ it.skipIf(process.platform !== "darwin")(
     });
   },
 );
+
+for (const cleanupFails of [false, true])
+  it(`retains completed provider signature facts when root finalization cancels (fails: ${cleanupFails})`, async () => {
+    const { path, target } = await fixture();
+    const controller = new AbortController();
+    const reason = { caller: "provider-final-root-close" };
+    const root = join(dirname(path), "controlled-snapshot-root");
+    let attempts = 0;
+    const client = new NativeMacOSProvider(
+      {},
+      new Captures(),
+      "darwin",
+      undefined,
+      async () => {
+        await mkdir(root);
+        return {
+          path: root,
+          async close() {
+            try {
+              if (cleanupFails && attempts++ === 0)
+                throw new Error("controlled provider root cleanup failure");
+              await rm(root, { recursive: true });
+            } finally {
+              controller.abort(reason);
+            }
+          },
+        };
+      },
+    ).createClient(target);
+    onTestFinished(async () => {
+      await client.close();
+    });
+    const result = await client.execute(
+      "inspect_signature",
+      {},
+      { signal: controller.signal },
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok)
+      throw new Error("Expected cancellation after completed provider facts");
+    expect(result.error.cleanupIncomplete).toBe(cleanupFails);
+    const facts = inspectSignatureSchema.parse(result.error.partialObservation);
+    expect(facts.signed).toBe(true);
+    expect(facts.provenance).toHaveLength(3);
+    expect(
+      projectAnalysisError(result.error).details?.partial_observation,
+    ).toEqual(facts);
+    expect((await client.close()).ok).toBe(true);
+    expect(resolvedAnalysisError(result.error)).toMatchObject({
+      _tag: "AnalysisCancelledError",
+      cause: reason,
+    });
+    await expect(lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+  });

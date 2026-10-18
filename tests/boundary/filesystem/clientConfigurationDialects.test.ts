@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,10 +14,7 @@ import { configureClientConfiguration } from "../../../src/application/SetupClie
 import { systemUninstallHost } from "../../../src/application/Uninstall.js";
 import { supportedClients } from "../../../src/application/SupportedClients.js";
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
-import {
-  classifyClientRegistrationCommand,
-  isOwnedClientRegistrationCommand,
-} from "../../../src/application/ClientRegistrationIdentity.js";
+import { classifyClientRegistrationCommand } from "../../../src/application/ClientRegistrationIdentity.js";
 import {
   CURRENT_ENTRYPOINT_PATH,
   normalizeEntrypointPath,
@@ -706,58 +703,172 @@ describe("platform-aware client config paths", () => {
 });
 
 describe("client registration command ownership", () => {
+  it.skipIf(process.platform === "win32").each([
+    ["rea", "rea-agents"],
+    ["rea-agents", "rea"],
+  ])(
+    "recognizes %s through its %s launcher alias",
+    async (registered, current) => {
+      const root = await createTestTempDirectory("rea-launcher-alias-");
+      const script = join(root, "entry.mjs");
+      await writeFile(script, "// owned dispatcher\n");
+      await symlink(script, join(root, registered));
+      await symlink(script, join(root, current));
+      for (const command of [
+        [join(root, registered), "mcp"],
+        [process.execPath, join(root, registered), "mcp"],
+      ]) {
+        expect(
+          classifyClientRegistrationCommand(command, join(root, current)),
+        ).toBe("owned");
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "distinguishes a confirmed different script from an unresolved alias",
+    async () => {
+      const root = await createTestTempDirectory("rea-launcher-foreign-");
+      const owned = join(root, "entry.mjs");
+      const foreign = join(root, "other.mjs");
+      await writeFile(owned, "// owned\n");
+      await writeFile(foreign, "// foreign\n");
+      await symlink(owned, join(root, "rea"));
+      await symlink(foreign, join(root, "rea-agents"));
+      await symlink(join(root, "missing.mjs"), join(root, "missing"));
+      for (const candidate of ["rea-agents", "missing"]) {
+        const command = [join(root, candidate), "mcp"];
+        expect(
+          classifyClientRegistrationCommand(command, join(root, "rea")),
+        ).toBe(candidate === "missing" ? "unknown" : "foreign");
+      }
+    },
+  );
+
+  it
+    .skipIf(process.platform === "win32")
+    .each(["registered", "current"] as const)(
+    "preserves unknown identity when the %s alias cannot resolve",
+    async (unresolved) => {
+      const root = await createTestTempDirectory("rea-launcher-unresolved-");
+      const script = join(root, "entry.mjs");
+      await writeFile(script, "// current dispatcher\n");
+      await symlink(join(root, "removed-release.mjs"), join(root, "dangling"));
+      await symlink(join(root, "cycle-b"), join(root, "cycle-a"));
+      await symlink(join(root, "cycle-a"), join(root, "cycle-b"));
+      for (const alias of ["dangling", "cycle-a"]) {
+        const registered =
+          unresolved === "registered" ? join(root, alias) : script;
+        const current = unresolved === "current" ? join(root, alias) : script;
+        for (const command of [
+          [registered, "mcp"],
+          [process.execPath, registered, "mcp"],
+        ])
+          expect(classifyClientRegistrationCommand(command, current)).toBe(
+            "unknown",
+          );
+      }
+    },
+  );
+});
+
+describe("client launcher traversal semantics", () => {
+  it.skipIf(process.platform === "win32")(
+    "distinguishes native executable traversal from Node script argument selection",
+    async () => {
+      const root = await createTestTempDirectory(
+        "rea-launcher-parent-segment-",
+      );
+      const current = join(root, "entry.mjs");
+      const foreign = join(root, "other", "entry.mjs");
+      await mkdir(join(root, "other", "child"), { recursive: true });
+      await writeFile(current, "// current dispatcher\n");
+      await writeFile(foreign, "// foreign dispatcher\n");
+      await symlink(join(root, "other", "child"), join(root, "link"));
+      const candidate = `${root}/link/../entry.mjs`;
+      expect(await readFile(candidate, "utf8")).toBe("// foreign dispatcher\n");
+      expect(
+        classifyClientRegistrationCommand([candidate, "mcp"], current),
+      ).toBe("unknown");
+      expect(
+        classifyClientRegistrationCommand([candidate, "mcp"], foreign),
+      ).toBe("unknown");
+      expect(
+        classifyClientRegistrationCommand(
+          [process.execPath, candidate, "mcp"],
+          current,
+        ),
+      ).toBe("owned");
+      const unresolvable = `${root}/missing/../entry.mjs`;
+      expect(
+        classifyClientRegistrationCommand([unresolvable, "mcp"], current),
+      ).toBe("unknown");
+      expect(
+        classifyClientRegistrationCommand([current, "mcp"], unresolvable),
+      ).toBe("unknown");
+      expect(
+        classifyClientRegistrationCommand(
+          [process.execPath, unresolvable, "mcp"],
+          current,
+        ),
+      ).toBe("owned");
+      const nodeAlias = join(root, "node-alias");
+      await symlink(process.execPath, nodeAlias);
+      expect(
+        classifyClientRegistrationCommand([nodeAlias, current, "mcp"], current),
+      ).toBe("owned");
+    },
+  );
+
   it("recognizes prior exact REA releases while rejecting foreign package commands", () => {
-    expect(isOwnedClientRegistrationCommand(["rea", "mcp"], undefined)).toBe(
-      true,
+    expect(classifyClientRegistrationCommand(["rea", "mcp"], undefined)).toBe(
+      "owned",
     );
     const cwdMatchingEntry = resolve("./rea");
     expect(
       classifyClientRegistrationCommand(["./rea", "mcp"], cwdMatchingEntry),
     ).toBe("unknown");
     expect(
-      isOwnedClientRegistrationCommand(["./rea", "mcp"], cwdMatchingEntry),
-    ).toBe(false);
-    expect(
-      isOwnedClientRegistrationCommand(
+      classifyClientRegistrationCommand(
         ["npx", "-y", `${PRODUCT_IDENTITY.packageName}@3.2.0`, "mcp"],
         undefined,
       ),
-    ).toBe(true);
+    ).toBe("owned");
     expect(
-      isOwnedClientRegistrationCommand(
+      classifyClientRegistrationCommand(
         ["npx", "-y", "another-package", "mcp"],
         undefined,
       ),
-    ).toBe(false);
+    ).toBe("foreign");
     expect(
-      isOwnedClientRegistrationCommand(
+      classifyClientRegistrationCommand(
         ["bunx", `${PRODUCT_IDENTITY.packageName}@3.2.0`, "mcp"],
         undefined,
       ),
-    ).toBe(true);
+    ).toBe("owned");
     expect(
-      isOwnedClientRegistrationCommand(
+      classifyClientRegistrationCommand(
         ["bunx", "another-package", "mcp"],
         undefined,
       ),
-    ).toBe(false);
+    ).toBe("foreign");
     expect(
-      isOwnedClientRegistrationCommand(
+      classifyClientRegistrationCommand(
         [process.execPath, "/packaged/rea.mjs", "mcp"],
         "/packaged/rea.mjs",
       ),
-    ).toBe(true);
+    ).toBe("owned");
     expect(
-      isOwnedClientRegistrationCommand(
+      classifyClientRegistrationCommand(
         [process.execPath, resolve("unknown"), "mcp"],
         normalizeEntrypointPath(""),
       ),
-    ).toBe(false);
+    ).toBe("unknown");
     expect(
-      isOwnedClientRegistrationCommand(
+      classifyClientRegistrationCommand(
         ["node", "/packaged/other-agent.mjs", "mcp"],
         "/packaged/rea.mjs",
       ),
-    ).toBe(false);
+    ).toBe("unknown");
   });
 });

@@ -42,8 +42,15 @@ export interface JavaScriptAnalysisAccumulator {
   electronCallPathLimitReached?: boolean;
   readonly references: LocatedJavaScriptFinding<JavaScriptStaticReference>[];
   readonly endpoints: LocatedJavaScriptFinding<JavaScriptStaticEndpoint>[];
-  /** Dynamic targets held until the shared mutation index is requested on demand. */
+  /** Target and receiver identities awaiting the shared mutation index. */
   readonly pendingNetworkCalls: {
+    readonly node:
+      | t.CallExpression
+      | t.OptionalCallExpression
+      | t.NewExpression;
+    readonly name: string;
+  }[];
+  readonly pendingSqliteCalls: {
     readonly node:
       | t.CallExpression
       | t.OptionalCallExpression
@@ -117,6 +124,7 @@ export const createJavaScriptAnalysisAccumulator = (
   endpoints: [],
   pendingNetworkCalls: [],
   storage: [],
+  pendingSqliteCalls: [],
   roles: [],
   sourceMaps: [],
   registrations: [],

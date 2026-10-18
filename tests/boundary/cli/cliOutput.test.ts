@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { workspaceCliTest } from "../../support/cli/workspaceCliFixture.js";
 
 import {
-  normalizeCliOutputArguments,
+  normalizeCliArguments,
   renderCliOutputArgumentError,
   renderEmptyFilteredCliOutput,
   validateCliOutputArguments,
@@ -60,9 +60,37 @@ describe("CLI output argument boundary", () => {
 });
 
 describe("CLI output flag value forms", () => {
+  it.each(["--filter-output", "--format", "--token-limit", "--token-offset"])(
+    "preserves a flag-shaped spaced value owned by %s",
+    (flag) => {
+      expect(
+        normalizeCliArguments([flag, "--format=json", "providers", "--json"]),
+      ).toEqual([flag, "--format=json", "providers", "--json"]);
+    },
+  );
+
+  workspaceCliTest(
+    "keeps a flag-shaped filter value equivalent in spaced and equals forms",
+    async ({ cli }) => {
+      for (const filter of [
+        ["--filter-output", "--format=json"],
+        ["--filter-output=--format=json"],
+      ]) {
+        const result = await cli.run({
+          arguments: [...filter, "providers", "--json"],
+          timeoutMs: 10_000,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout)).toEqual({});
+        expect(result.stderr).toBe("");
+      }
+    },
+    CLI_INTEGRATION_TIMEOUT_MS,
+  );
+
   it("splits only the equals forms of valued output flags", () => {
     expect(
-      normalizeCliOutputArguments([
+      normalizeCliArguments([
         "inspect-sqlite-database",
         "--table=a=b",
         "--format=json",
@@ -506,5 +534,62 @@ describe("compiled CLI artifact diagnostics", () => {
       expect(output).toContain('"unpacked":true');
     },
     CLI_INTEGRATION_TIMEOUT_MS,
+  );
+});
+
+describe("CLI update root alias", () => {
+  it.each([
+    [["--update"], ["update"]],
+    [
+      ["--json", "--update", "--filter-output=status"],
+      ["update", "--json", "--filter-output", "status"],
+    ],
+    [
+      ["--format=yaml", "--update", "--full-output"],
+      ["update", "--format", "yaml", "--full-output"],
+    ],
+    [
+      ["--update", "--token-limit=100", "--token-count"],
+      ["update", "--token-limit", "100", "--token-count"],
+    ],
+    [["--update", "--update"], ["update"]],
+    [
+      ["--filter-output", "--update"],
+      ["--filter-output", "--update"],
+    ],
+    [
+      ["--filter-output=--update", "--update"],
+      ["update", "--filter-output", "--update"],
+    ],
+    [
+      ["--update", "--help"],
+      ["--update", "--help"],
+    ],
+    [
+      ["--incur-update-check", "--update"],
+      ["--incur-update-check", "--update"],
+    ],
+    [
+      ["providers", "--update"],
+      ["providers", "--update"],
+    ],
+    [
+      ["--", "--update"],
+      ["--", "--update"],
+    ],
+    [
+      ["--config", "--update"],
+      ["--config", "--update"],
+    ],
+    [
+      ["update", "--json"],
+      ["update", "--json"],
+    ],
+  ])(
+    "routes only an unambiguous root update while retaining option data: %j",
+    (input, expected) => {
+      expect(normalizeCliArguments(input)).toEqual(expected);
+      expect(normalizeCliArguments(expected)).toEqual(expected);
+    },
   );
 });

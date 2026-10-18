@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
-import { verifyAndroidInitializers } from "./initializers.mjs";
+import { verifyAndroidMethodBodies } from "./method-bodies.mjs";
 import { verifyAndroidDirectInvokes } from "./direct-invokes.mjs";
 
 /** Prove cold metadata stays unmaterialized and overload identities survive code generation. */
@@ -67,11 +67,27 @@ export const verifyAndroidMetadata = async ({
     );
     assert.match(
       result.stdout,
+      /LOAD_FAILURE_REGRESSION_PASS typed=true decoy=true suspension=true cancellation=true/u,
+    );
+    assert.match(
+      result.stdout,
       /METADATA_REGRESSION_PASS classes=\d+ overloads=3/u,
     );
     assert.match(
       result.stdout,
+      /CLASS_SEARCH_REGRESSION_PASS pages=\d+ nonzero=true/u,
+    );
+    assert.match(
+      result.stdout,
       /INITIALIZER_REGRESSION_PASS folded=2 bounded=true/u,
+    );
+    assert.match(
+      result.stdout,
+      /NO_BODY_REGRESSION_PASS native=true abstract=true frozen=true/u,
+    );
+    assert.match(
+      result.stdout,
+      /MERGED_METHOD_REGRESSION_PASS exact=true overloaded=true handlers=true/u,
     );
     assert.match(
       result.stdout,
@@ -81,12 +97,18 @@ export const verifyAndroidMetadata = async ({
       "PASS real cold metadata, full generic types and stable overloaded method selection",
     );
     console.log(
+      "PASS real Java filtered pages, nonzero inventory cursors and complete combined results",
+    );
+    console.log(
       "PASS real folded and mixed static initializers, absent bodies and bounded smali",
+    );
+    console.log(
+      "PASS real native/abstract absence before and after neighbouring code generation",
     );
     console.log(
       "PASS real raw DEX direct-invoke offsets and cross-DEX source identity",
     );
-    await verifyAndroidInitializers({
+    await verifyAndroidMethodBodies({
       apk: resolve(classes, "initializers.apk"),
       repository,
       entrypoint,

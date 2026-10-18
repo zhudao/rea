@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   closeEnhancedToolResources,
-  connect,
+  connect as connectTool,
   jsonResult,
 } from "./enhancedToolsHarness.js";
 import type {
@@ -19,6 +19,23 @@ import { err, type Result } from "../../../src/domain/result.js";
 import { observed as ok } from "../../fixtures/analysisExecution.js";
 
 afterEach(closeEnhancedToolResources);
+
+// These fixtures exercise composition for providers without a native overview.
+const connect = (analysis: AnalysisOperationPort) =>
+  connectTool({
+    execute: (operation, parameters, options) =>
+      operation === "read_binary_inventory_summary"
+        ? Promise.resolve(
+            err(
+              new AnalysisCapabilityUnavailableError(
+                "fixture",
+                operation,
+                "No native overview",
+              ),
+            ),
+          )
+        : analysis.execute(operation, parameters, options),
+  });
 
 it("discovers declarations without counting duplicates or compiler bookkeeping", async () => {
   const client = await connect({
@@ -425,4 +442,38 @@ describe("overview document identity through MCP", () => {
       },
     });
   });
+});
+
+it("refuses document fallback while the current-selection owner reports incomplete cleanup", async () => {
+  const failure = new AnalysisCapabilityUnavailableError(
+    "fixture",
+    "current_document",
+    "Selection unavailable during cleanup",
+    {
+      cleanup: {
+        reason: "controlled live selection resource",
+        resources: ["selection owner"],
+      },
+    },
+  );
+  const calls: string[] = [];
+  const client = await connect({
+    execute: async (operation) => {
+      calls.push(operation);
+      return operation === "current_document"
+        ? err(failure)
+        : ok(["must-not-be-selected"]);
+    },
+  });
+  const response = await client.callTool({
+    name: "binary_overview",
+    arguments: {},
+  });
+  expect(response.isError).toBe(true);
+  expect(parseMcpToolError(response).error).toMatchObject({
+    code: "cleanup_incomplete",
+    details: { operation: "current_document" },
+  });
+  expect(calls).toEqual(["current_document"]);
+  expect(failure.cleanupIncomplete).toBe(true);
 });

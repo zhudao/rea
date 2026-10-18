@@ -7,10 +7,13 @@ import {
   RegularFileCancelled,
   RegularFileCleanupFailure,
 } from "../filesystem/OwnedRegularFile.js";
-import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import {
-  ArtifactResourceRetryFailure,
-  type ArtifactResourceScope,
+  ArtifactReaderFailure,
+  artifactPrimaryCleanupLeases,
+} from "./ArtifactReader.js";
+import type {
+  ArtifactResourceOwner,
+  ArtifactResourceScope,
 } from "./ArtifactResourceScope.js";
 import {
   AnalysisCleanupLease,
@@ -22,7 +25,7 @@ import type { AnalysisError } from "../domain/analysisErrorBase.js";
 export class ArtifactFileCleanupFailure<
   Value = unknown,
 > extends ArtifactReaderFailure {
-  readonly cleanupLeases: readonly AnalysisCleanupLease[] | undefined;
+  override readonly cleanupLeases: readonly AnalysisCleanupLease[] | undefined;
   readonly fileCleanupFailure: RegularFileCleanupFailure<Value>;
   constructor(
     fileCleanupFailure: RegularFileCleanupFailure<Value>,
@@ -77,13 +80,9 @@ export class ArtifactFileCleanupFailure<
     );
     this.fileCleanupFailure = fileCleanupFailure;
     const inherited =
-      primary instanceof ArtifactFileCleanupFailure ||
-      primary instanceof ArtifactResourceRetryFailure
-        ? primary.cleanupLeases
-        : primary instanceof ArtifactReaderFailure &&
-            primary.cleanup !== undefined
-          ? undefined
-          : [];
+      fileCleanupFailure.outcome.kind === "failed"
+        ? artifactPrimaryCleanupLeases(fileCleanupFailure.outcome.cause)
+        : [];
     this.cleanupLeases =
       inherited === undefined
         ? undefined
@@ -149,11 +148,7 @@ export const bindArtifactFileCleanup = (
   error: AnalysisError,
 ): void => {
   const leases =
-    cause instanceof ArtifactFileCleanupFailure
-      ? cause.cleanupLeases
-      : cause instanceof ArtifactResourceRetryFailure
-        ? cause.cleanupLeases
-        : undefined;
+    cause instanceof ArtifactReaderFailure ? cause.cleanupLeases : undefined;
   if (leases !== undefined) new AnalysisCleanupLeaseGroup(error, leases);
 };
 
@@ -179,7 +174,11 @@ export const assertArtifactReadActive = (
 /** Admit a regular file without blocking on pipes, retaining failed admission closes. */
 export const withArtifactRegularFile = async <Value>(
   path: string,
-  resources: ArtifactResourceScope,
+  resources: {
+    retain(
+      owner: Extract<ArtifactResourceOwner, { readonly kind: "lease" }>,
+    ): void;
+  },
   signal: AbortSignal | undefined,
   operation: (file: FileHandle) => Promise<Value>,
   symlinks: "follow" | "reject" = "reject",

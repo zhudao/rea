@@ -6,6 +6,38 @@ import {
   plistJsonNeedsNumberTypes,
 } from "./plist.js";
 
+it("retains complete segmented XML keys in native plist fallback evidence", () => {
+  const parsed = parsePlistXml(
+    "<plist><dict><key>user<![CDATA[ID]]></key><integer>42</integer><key>__pro<![CDATA[to__]]></key><string>omitted</string><key>Blob</key><data>AA==</data></dict></plist>",
+  );
+  if (!parsed.ok) throw parsed.error;
+  expect(parsed.value.value).toEqual({
+    userID: 42,
+    Blob: { $plist_type: "data", base64: "AA==" },
+  });
+  expect(parsed.value.limitations).toContain(
+    "1 dictionary entry keyed __proto__ was omitted because REA results cannot represent that key.",
+  );
+});
+
+it("does not relabel integral CDATA reals as integers in native JSON or XML evidence", () => {
+  const xml =
+    "<plist><dict><key>integer</key><integer>9007199254740992</integer><key>real</key><real>9007199254<![CDATA[740992]]></real></dict></plist>";
+  for (const parsed of [
+    parsePlistJson('{"integer":9007199254740992,"real":9007199254740992}', xml),
+    parsePlistXml(xml),
+  ]) {
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.value).toEqual({
+      integer: 9007199254740992,
+      real: 9007199254740992,
+    });
+    expect(parsed.value.limitations).toContainEqual(
+      expect.stringContaining("2 number(s)"),
+    );
+  }
+});
+
 it("keeps exact decimal text for JSON integers that XML shows are integers", () => {
   const parsed = parsePlistJson(
     '{"Max":18446744073709551615,"Min":-9223372036854775808,"Near":9007199254740993,"Edge":9007199254740992,"Safe":9007199254740991,"Real":1e21,"Ratio":0.5}',
@@ -111,6 +143,31 @@ it("keeps integral XML reals beyond the safe range as reals", () => {
   ]);
 });
 
+it("keeps negative-zero reals distinct in native JSON and XML evidence", () => {
+  for (const parsed of [
+    parsePlistJson(
+      '{"Negative":-0.0,"Spelled":-0,"Positive":0.0,"Integer":0,"Ratio":1.25}',
+    ),
+    parsePlistXml(
+      "<plist><dict><key>Negative</key><real>-0.0</real><key>Spelled</key><real>-0</real><key>Positive</key><real>0.0</real><key>Integer</key><integer>-0</integer><key>Ratio</key><real>1.25</real></dict></plist>",
+    ),
+  ]) {
+    if (!parsed.ok) throw parsed.error;
+    expect(JSON.stringify(parsed.value.value)).toBe(
+      '{"Negative":{"$plist_type":"real","value":"-0"},"Spelled":{"$plist_type":"real","value":"-0"},"Positive":0,"Integer":0,"Ratio":1.25}',
+    );
+    expect(parsed.value.limitations).toContain(
+      '2 negative-zero real value(s) are reported as { "$plist_type": "real", "value": "-0" } because a JSON number cannot carry the sign of zero.',
+    );
+  }
+});
+
+it("reports no negative-zero limitation for positive zero", () => {
+  const parsed = parsePlistJson('{"Positive":0.0,"Integer":0}');
+  if (!parsed.ok) throw parsed.error;
+  expect(parsed.value.limitations).toEqual([]);
+});
+
 it("reports XML numbers whose integer or real origin is ambiguous", () => {
   const parsed = parsePlistXml(
     "<plist><array><integer>9007199254740993</integer><real>9007199254740992</real><data>AA==</data></array></plist>",
@@ -124,5 +181,20 @@ it("reports XML numbers whose integer or real origin is ambiguous", () => {
   expect(parsed.value.limitations).toEqual([
     expect.stringContaining("XML conversion"),
     expect.stringContaining("2 number(s)"),
+  ]);
+});
+
+it("keeps CFPropertyList's non-finite real spellings in XML evidence", () => {
+  const parsed = parsePlistXml(
+    "<plist><dict><key>Up</key><real>+infinity</real><key>Down</key><real>-INFINITY</real><key>Missing</key><real>nan</real><key>Overflow</key><real>1e999</real><key>Ratio</key><real>1.25</real></dict></plist>",
+  );
+  if (!parsed.ok) throw parsed.error;
+  expect(JSON.stringify(parsed.value.value)).toBe(
+    '{"Up":{"$plist_type":"real","value":"+infinity"},"Down":{"$plist_type":"real","value":"-infinity"},"Missing":{"$plist_type":"real","value":"nan"},"Overflow":{"$plist_type":"real","value":null},"Ratio":1.25}',
+  );
+  expect(parsed.value.limitations).toEqual([
+    expect.stringContaining("XML conversion"),
+    '3 non-finite real value(s) are reported as { "$plist_type": "real", "value": "<spelling>" } using canonical numeric labels nan, +infinity or -infinity because a JSON number cannot carry them.',
+    '1 numeric value(s) are reported as { "$plist_type": "real", "value": null } because XML numeric decoding could not establish their value identity.',
   ]);
 });

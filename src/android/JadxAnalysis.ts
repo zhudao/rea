@@ -2,7 +2,6 @@ import type { z } from "zod";
 import type { AndroidRequest } from "../domain/android/androidAnalysis.js";
 import { androidResultSchemas } from "../domain/android/androidAnalysis.js";
 import {
-  AnalysisCapabilityUnavailableError,
   AnalysisInputError,
   AnalysisOutputError,
 } from "../domain/analysisErrorCore.js";
@@ -16,7 +15,6 @@ import {
   jadxXrefsSchema,
   normalizeJadxText,
 } from "./JadxProtocol.js";
-import { JADX_RELEASE } from "./JadxRelease.js";
 
 /** The adapter consumes tool payloads, never provider RPC details outside this layer. */
 export interface JadxToolPort {
@@ -136,56 +134,55 @@ const searchClasses = async (
   loaded: z.infer<typeof jadxLoadSchema>,
   engine: Engine,
 ): Promise<JsonValue> => {
-  const classes: string[] = [];
+  const matches: string[] = [];
   const pageSize = 4096;
-  let total: number | undefined;
+  let offset = 0;
   do {
     const page = jadxClassPageSchema.parse(
       await tools.json("list_classes", {
-        offset: classes.length,
+        query: request.input.query,
+        offset,
         limit: pageSize,
       }),
     );
     if (
-      (total !== undefined && total !== page.total) ||
-      page.offset !== classes.length ||
+      page.total_classes !== loaded.class_count ||
+      page.offset !== offset ||
       page.limit !== pageSize ||
-      page.items.length > pageSize
+      page.next_offset < offset ||
+      page.next_offset > loaded.class_count ||
+      page.items.length > pageSize ||
+      page.items.length > page.next_offset - offset ||
+      (request.input.query === "" &&
+        page.items.length !== page.next_offset - offset) ||
+      page.items.some((name) => !name.includes(request.input.query))
     )
       throw new AnalysisOutputError(
         request.operation,
         "JADX class pagination changed identity or counts",
       );
-    total = page.total;
-    classes.push(...page.items);
     if (
-      classes.length > total ||
-      (page.items.length === 0 && classes.length < total)
+      (offset < loaded.class_count && page.next_offset === offset) ||
+      (page.next_offset < loaded.class_count && page.items.length !== pageSize)
     )
       throw new AnalysisOutputError(
         request.operation,
         "JADX class pagination is incomplete",
       );
-  } while (classes.length < total);
-  if (total !== loaded.class_count)
-    throw new AnalysisOutputError(
-      request.operation,
-      "JADX class inventory count differs from the loaded class count",
-    );
+    matches.push(...page.items);
+    offset = page.next_offset;
+  } while (offset < loaded.class_count);
   const occurrences = new Map<string, number>();
-  for (const name of classes)
+  for (const name of matches)
     occurrences.set(name, (occurrences.get(name) ?? 0) + 1);
-  const matchingNames = classes.filter((name) =>
-    name.includes(request.input.query),
-  );
   const duplicateNames = [...occurrences]
-    .filter(([name, count]) => count > 1 && name.includes(request.input.query))
+    .filter(([, count]) => count > 1)
     .map(([name, count]) => ({ name, occurrences: count }));
   return androidResultSchemas.search_android_classes.parse({
     engine,
     query: request.input.query,
-    total_classes: total,
-    matches: matchingNames,
+    total_classes: loaded.class_count,
+    matches,
     duplicate_names: duplicateNames,
     coverage: "complete",
   });
@@ -224,8 +221,8 @@ const inspectMethod = async (
       `Select one of ${candidates.length} overloads: ${candidates.map((method) => `${method.overload_index}: ${method.reported_signature}`).join("; ")}`,
     );
   const index = request.input.overload_index ?? 0;
-  const selected = candidates[index];
-  if (selected === undefined)
+  const selected =
+    candidates[index] ??
     inputFailure(
       request,
       "overload_index",
@@ -243,22 +240,12 @@ const inspectMethod = async (
     body.class_name !== summary.full_name ||
     body.method_name !== request.input.method_name ||
     body.overload_index !== index ||
-    body.overload_count !== candidates.length
+    body.overload_count !== candidates.length ||
+    body.dex_descriptor !== selected.dex_descriptor
   )
     throw new AnalysisOutputError(
       request.operation,
       "JADX returned a different method or overload inventory",
-    );
-  if (body.body.startsWith("// ERROR:"))
-    throw new AnalysisOutputError(
-      request.operation,
-      `JADX did not produce method source: ${body.body}`,
-    );
-  if (body.mode === "smali" && candidates.length > 1)
-    throw new AnalysisCapabilityUnavailableError(
-      "jadx",
-      request.operation,
-      `JADX ${JADX_RELEASE.version} smali fallback joins all same-name overloads for ${summary.full_name}.${request.input.method_name}; it cannot establish source for only overload ${index}.`,
     );
   return androidResultSchemas.inspect_android_method.parse({
     engine,
@@ -266,12 +253,7 @@ const inspectMethod = async (
     method: selected,
     overload_count: candidates.length,
     representation: body.mode,
-    body_status:
-      body.body.length === 0 ||
-      body.body ===
-        "// method exists but has no decompiled body (native/abstract)"
-        ? "not_available"
-        : "available",
+    body_status: body.body.length === 0 ? "not_available" : "available",
     fell_back: body.fell_back,
     markers: body.markers,
     source: normalizeJadxText(body.body),

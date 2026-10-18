@@ -1,6 +1,7 @@
 import { z } from "zod";
+import { RegularFileCleanupFailure } from "./RegularFileRead.js";
 
-import { isOwnedClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
+import { classifyClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
 import { readClientRegistrationInspections } from "./ClientRegistrationStatus.js";
 import { existingSkillDestinations } from "./SetupSkill.js";
 import type { SetupAction } from "./SetupTypes.js";
@@ -65,7 +66,8 @@ export const existingMaintenanceScope = async (
     if (
       activation !== "enabled" ||
       (registration.state !== "aligned" && registration.state !== "stale") ||
-      !isOwnedClientRegistrationCommand(registration.command, entryPoint)
+      classifyClientRegistrationCommand(registration.command, entryPoint) !==
+        "owned"
     )
       continue;
     clients.push(registration.client);
@@ -149,6 +151,9 @@ export const planIntegrationMaintenance = async (
       ),
     };
   } catch (cause: unknown) {
+    // Without a supplied scope, the typed failure is the caller's cleanup capability.
+    if (resources === undefined && cause instanceof RegularFileCleanupFailure)
+      throw cause;
     return {
       status: "unavailable",
       remediation: cause instanceof Error ? cause.message : String(cause),

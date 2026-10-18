@@ -11,22 +11,48 @@ const VALUED_OUTPUT_FLAGS = new Set([
   "--token-offset",
 ]);
 
+const ROOT_UPDATE_OUTPUT_FLAGS = new Set([
+  "--json",
+  "--full-output",
+  "--token-count",
+]);
+
 /**
- * Split `--flag=value` forms of the valued output flags. Incur reads these
+ * Route the root update alias and split `--flag=value` output forms. Incur reads these
  * flags only in spaced form, so `--format=json` otherwise reaches the command
  * parser and fails as an unknown flag. Command options accept both forms.
  */
-export const normalizeCliOutputArguments = (
+export const normalizeCliArguments = (
   arguments_: readonly string[],
-): string[] =>
-  arguments_.flatMap((argument) => {
+): string[] => {
+  const normalized: string[] = [];
+  const updates = new Set<number>();
+  let rootUpdate = true;
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index]!;
+    if (VALUED_OUTPUT_FLAGS.has(argument) && arguments_[index + 1]) {
+      // Incur consumes a nonempty spaced value before looking for more flags.
+      // Its contents belong to that option, even when they look like a flag.
+      normalized.push(argument, arguments_[index + 1]!);
+      index += 1;
+      continue;
+    }
     const separator = argument.indexOf("=");
-    if (separator < 0) return [argument];
     const flag = argument.slice(0, separator);
-    return VALUED_OUTPUT_FLAGS.has(flag)
-      ? [flag, argument.slice(separator + 1)]
-      : [argument];
-  });
+    if (separator >= 0 && VALUED_OUTPUT_FLAGS.has(flag))
+      normalized.push(flag, argument.slice(separator + 1));
+    else {
+      if (argument === "--update") updates.add(normalized.length);
+      else if (!ROOT_UPDATE_OUTPUT_FLAGS.has(argument)) rootUpdate = false;
+      normalized.push(argument);
+    }
+  }
+  // Output option values were consumed above; flag-shaped data is never an alias.
+  // Help/check/command/unknown tokens retain Incur's parsing and precedence.
+  return rootUpdate && updates.size > 0
+    ? ["update", ...normalized.filter((_, index) => !updates.has(index))]
+    : normalized;
+};
 
 export type CliOutputArgumentValidation =
   | { readonly ok: true }
@@ -79,7 +105,7 @@ export const parseCliOutputArguments = (
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     // Incur scans builtins across `--` and reads spaced value forms, which
-    // normalizeCliOutputArguments has produced. Mirror those effective values.
+    // normalizeCliArguments has produced. Mirror those effective values.
     if (argument === "--json") {
       format = "json";
       continue;

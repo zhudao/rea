@@ -2,7 +2,10 @@ import { z } from "zod";
 import { localPathStringSchema } from "../localPath.js";
 import { digestSchema } from "../digests.js";
 
-const MAX_STRINGS = 2_000;
+export const MAX_STRINGS = 2_000;
+export const MAX_SELECTED_LOCALES = 20;
+export const MAX_AGGREGATE_STRINGS = 10_000;
+export const AGGREGATE_STRINGS_XML_MAX_BYTES = 32 * 1024 * 1024;
 const ANDROID_NON_LOCALE_QUALIFIERS = new Set([
   "car",
   "desk",
@@ -14,10 +17,15 @@ const ANDROID_NON_LOCALE_QUALIFIERS = new Set([
   "notnight",
 ]);
 
+// Apktool emits b+language[+script][+region][+variant] from ARSC fields:
+// language/region expand to at most 3 ASCII characters, script has 4 bytes,
+// and variant has 8 bytes (BinaryResourceParser / ResConfig).
+const MAX_ANDROID_LOCALE_SUFFIX = 2 + 3 + (1 + 4) + (1 + 3) + (1 + 8);
+
 const localeQualifierSchema = z
   .string()
   .min(2)
-  .max(16)
+  .max(MAX_ANDROID_LOCALE_SUFFIX)
   .regex(
     /^(?:[a-z]{2,3}(?:-(?:r?[A-Z]{2}|r?[0-9]{3}))?|b\+[a-z]{2,3}(?:\+[A-Za-z0-9]{2,8})*)$/u,
     "Locale must look like de, pt-BR, pt-rBR, or b+zh+Hans+CN",
@@ -29,6 +37,22 @@ const localeQualifierSchema = z
 
 /** Locale language tags admitted by Android resource table selection. */
 export const androidLocaleQualifierSchema = localeQualifierSchema;
+
+/** Normalize an admitted request alias at the locale-selection owner. */
+export const androidLocaleDirectorySuffix = (locale: string): string =>
+  locale.replace(/^([a-z]{2,3})-([A-Z]{2}|[0-9]{3})$/u, "$1-r$2");
+
+/** Exact selectable table names are distinct from whole resource configurations. */
+export const classifyAndroidStringsTable = (
+  suffix: string,
+):
+  | { readonly kind: "locale"; readonly locale: string }
+  | { readonly kind: "other"; readonly suffix: string } => {
+  const parsed = androidLocaleQualifierSchema.safeParse(suffix);
+  return parsed.success && androidLocaleDirectorySuffix(parsed.data) === suffix
+    ? { kind: "locale", locale: parsed.data }
+    : { kind: "other", suffix };
+};
 
 /**
  * Caller intent for Apktool-backed resource decoding. Apktool is
@@ -49,6 +73,14 @@ export const apktoolInputSchemas = {
       .optional()
       .describe(
         "Project strings from res/values-<locale>/strings.xml instead of the default table",
+      ),
+    locales: z
+      .array(androidLocaleQualifierSchema)
+      .min(1)
+      .max(MAX_SELECTED_LOCALES)
+      .optional()
+      .describe(
+        `Project multiple localized string tables from res/values-<locale>/strings.xml alongside the default table (bounded to ${String(MAX_SELECTED_LOCALES)} locales)`,
       ),
   }),
 } as const;
@@ -80,6 +112,46 @@ const client = z.strictObject({
   command_source: z.enum(["environment", "path"]),
   apktool_version: z.string().min(1).nullable(),
 });
+
+/** An individual projected Android string table from an Apktool decode. */
+export const stringTableSchema = z.strictObject({
+  locale: z
+    .string()
+    .nullable()
+    .describe(
+      "null for default res/values/strings.xml, or the locale qualifier",
+    ),
+  status: z
+    .enum(["present", "missing", "oversized", "malformed", "skipped"])
+    .describe(
+      "Table availability: present, missing from APK, oversized, malformed XML, or skipped due to limits",
+    ),
+  strings: z.array(
+    z.strictObject({
+      name: z.string().min(1),
+      value: z.string(),
+    }),
+  ),
+  total_count: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .describe(
+      "Total valid string entries before output limits, or null if the table was not examined or was malformed",
+    ),
+  unparsed_count: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .describe(
+      "Entries skipped due to nested markup or missing attributes, or null if the table was not examined or was malformed",
+    ),
+  coverage: z.enum(["complete", "partial"]),
+});
+
+export type StringTable = z.infer<typeof stringTableSchema>;
 
 /** Portable Apktool observations with explicit coverage limitations. */
 export const apktoolResultSchemas = {
@@ -114,7 +186,12 @@ export const apktoolResultSchemas = {
     ),
     locale: z.string().nullable(),
     locales: z.array(z.string().min(1)),
+    string_tables: z.array(stringTableSchema).optional(),
     decoded_file_count: z.number().int().nonnegative(),
     coverage: z.enum(["complete", "partial"]),
   }),
 } as const;
+
+export type ApktoolDecodeResult = z.infer<
+  typeof apktoolResultSchemas.decode_android_resources
+>;

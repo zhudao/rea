@@ -18,7 +18,7 @@ import {
   parseGhidraInventoryInput,
   parseGhidraInventoryResult,
 } from "../dist/ghidra/GhidraInventoryValues.js";
-import { inspectGhidraInstallation } from "../dist/ghidra/GhidraInstallation.js";
+import { inspectVerifierGhidraInstallation } from "./lib/ghidra-installation-inspection.mjs";
 import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraReleasePolicy.js";
 import { GhidraHeadlessLauncher } from "../dist/ghidra/GhidraLauncher.js";
 import { GHIDRA_PROVIDER_IDENTITY } from "../dist/ghidra/GhidraProviderCapabilities.js";
@@ -59,7 +59,7 @@ if (installDir === undefined || !isAbsolute(installDir))
   throw new Error(
     "Set GHIDRA_INSTALL_DIR to the absolute root of Ghidra 12.1.4.",
   );
-const installation = inspectGhidraInstallation({
+const installation = await inspectVerifierGhidraInstallation({
   environment: process.env,
   installDir,
   ...(process.env.JAVA_HOME === undefined
@@ -166,6 +166,16 @@ try {
     !Array.isArray(strings)
   )
     throw new Error("Windows Ghidra inventory proof was incomplete");
+  const overview = await inventory("read_binary_inventory_summary", {});
+  if (
+    overview.document !== documents[0] ||
+    overview.procedure_count !== procedures.length ||
+    overview.string_count !== strings.length ||
+    overview.segment_count !== segments.length
+  )
+    throw new Error(
+      "Windows Ghidra overview aggregates disagree with inventories",
+    );
   const procedure = procedures.find(
     (item) => item.procedure?.external === false,
   );

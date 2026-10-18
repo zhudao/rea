@@ -1,9 +1,6 @@
-import {
-  DOMParser,
-  type Document,
-  type Element,
-  type Node,
-} from "@xmldom/xmldom";
+import type { Element, Node } from "@xmldom/xmldom";
+import { parseXmlDocument } from "../domain/xmlDocument.js";
+import { ok, err, type Result } from "../domain/result.js";
 import {
   isMap,
   isScalar,
@@ -57,8 +54,16 @@ export const parseApktoolYml = (yml: string): ApktoolMetadata => {
 
 /** Read the package attribute from the decoded Android manifest root. */
 export const parseManifestPackage = (manifest: string): string | null => {
-  const document = parseXml(manifest, "AndroidManifest.xml");
-  const root = document.documentElement;
+  const parsed = parseXmlDocument(manifest, {
+    doctype: "allow",
+    lineEndings: "preserve",
+  });
+  if (!parsed.ok)
+    throw new TypeError(
+      `AndroidManifest.xml is not well-formed XML: ${parsed.error.message}`,
+      { cause: parsed.error },
+    );
+  const root = parsed.value.documentElement;
   if (root === null || root.nodeName !== "manifest")
     throw new TypeError("AndroidManifest.xml root must be <manifest>");
   return root.getAttribute("package") || null;
@@ -69,6 +74,18 @@ export interface DecodedStringEntry {
   readonly value: string;
 }
 
+/** A whole-document failure does not establish an omitted-entry count. */
+export class ApktoolStringsDocumentError extends Error {
+  readonly _tag = "ApktoolStringsDocumentError";
+  constructor(
+    readonly reason: "malformed" | "wrong_root",
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
 /**
  * Project direct `<string>` children from decoded resources XML. DOM parsing
  * identifies elements and attributes; text values are sliced from the input
@@ -77,19 +94,31 @@ export interface DecodedStringEntry {
  */
 export const parseDecodedStrings = (
   stringsXml: string,
-): {
-  entries: readonly DecodedStringEntry[];
-  unparsedCount: number;
-} => {
-  let document: Document;
-  try {
-    document = parseXml(stringsXml, "strings.xml");
-  } catch {
-    return { entries: [], unparsedCount: 1 };
-  }
-  const root = document.documentElement;
+): Result<
+  {
+    readonly entries: readonly DecodedStringEntry[];
+    readonly unparsedCount: number;
+  },
+  ApktoolStringsDocumentError
+> => {
+  const parsed = parseXmlDocument(stringsXml, {
+    doctype: "allow",
+    lineEndings: "preserve",
+  });
+  if (!parsed.ok)
+    return err(
+      new ApktoolStringsDocumentError("malformed", parsed.error.message, {
+        cause: parsed.error,
+      }),
+    );
+  const root = parsed.value.documentElement;
   if (root === null || root.nodeName !== "resources")
-    return { entries: [], unparsedCount: 1 };
+    return err(
+      new ApktoolStringsDocumentError(
+        "wrong_root",
+        "String resource document root must be <resources>",
+      ),
+    );
 
   const entries: DecodedStringEntry[] = [];
   let unparsedCount = 0;
@@ -129,7 +158,7 @@ export const parseDecodedStrings = (
     }
     entries.push({ name, value: value.join("") });
   }
-  return { entries, unparsedCount };
+  return ok({ entries, unparsedCount });
 };
 
 const yamlScalar = (
@@ -144,19 +173,6 @@ const yamlScalar = (
   return range === null || range === undefined
     ? String(node.value)
     : source.slice(range[0], range[1]);
-};
-
-const parseXml = (xml: string, label: string) => {
-  const errors: string[] = [];
-  const document = new DOMParser({
-    normalizeLineEndings: (source) => source,
-    onError: (_level, message) => errors.push(message),
-  }).parseFromString(xml, "application/xml");
-  if (errors.length > 0 || document.documentElement === null)
-    throw new TypeError(
-      `${label} is not well-formed XML${errors[0] === undefined ? "" : `: ${errors[0]}`}`,
-    );
-  return document;
 };
 
 const childNodes = (node: Node): Node[] => {

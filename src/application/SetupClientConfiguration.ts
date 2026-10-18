@@ -21,9 +21,10 @@ import {
   type ClientConfigurationDocument,
 } from "./ClientConfigurationDocument.js";
 import { dshDocument, DshCordisDocument } from "./DshCordisPatch.js";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import writeFileAtomic from "write-file-atomic";
+import { isClientConfigurationCleanupFailure } from "./ClientConfigurationCleanup.js";
+import { ClientConfigurationPublication } from "./ClientConfigurationPublication.js";
 import {
   clientRegistrationEnvironment,
   clientRegistrationEnvironmentDetails,
@@ -291,9 +292,10 @@ const persistClientConfiguration = async ({
           ),
         }
       : registered;
+  let publication: ClientConfigurationPublication;
   try {
     await mkdir(dirname(client.configPath), { recursive: true });
-    await writeFileAtomic(
+    publication = await ClientConfigurationPublication.write(
       transactionPath,
       serializeClientConfiguration(document, format, original, [
         ...Object.keys(fallbackServers)
@@ -303,63 +305,65 @@ const persistClientConfiguration = async ({
         ...(legacyPath === undefined ? [] : [legacyPath]),
         ...(enableOmp ? [[OMP_DISABLED_SERVERS_KEY]] : []),
       ]),
-      {
-        encoding: "utf8",
-        mode: 0o600,
-      },
+      original,
+      0o600,
     );
   } catch (cause: unknown) {
+    if (isClientConfigurationCleanupFailure(cause)) throw cause;
     // Write failure is reported by the status reason.
     void cause;
     return { status: "failed", reason: "write" };
   }
-  try {
-    const readback = parseClientConfiguration(
-      await readRegularFileText(transactionPath),
-      format,
-    );
-    if (
-      !registrationCurrent(readback, desired) ||
-      Object.entries(fallbackServers).some(
-        ([name, entry]) =>
-          name !== PRODUCT_IDENTITY.mcpServerKey &&
-          !clientConfigurationValuesEqual(readback.servers[name], entry),
-      )
-    ) {
+  return publication.verify(async () => {
+    try {
+      const readback = parseClientConfiguration(
+        await readRegularFileText(publication.path),
+        format,
+      );
+      await publication.assertCurrent();
+      if (
+        !registrationCurrent(readback, desired) ||
+        Object.entries(fallbackServers).some(
+          ([name, entry]) =>
+            name !== PRODUCT_IDENTITY.mcpServerKey &&
+            !clientConfigurationValuesEqual(readback.servers[name], entry),
+        )
+      ) {
+        return rollbackOrReadbackFailure(
+          publication,
+          original,
+          recoveryBackupPath,
+        );
+      }
+    } catch (cause: unknown) {
+      if (cause instanceof RegularFileCleanupFailure) {
+        const rollback = await restoreConfig(publication, original);
+        if (!rollback.ok)
+          throw new ClientConfigurationCleanupRollbackFailure(cause, {
+            status: "failed",
+            reason: "rollback",
+            ...(recoveryBackupPath === undefined
+              ? {}
+              : { backupPath: recoveryBackupPath }),
+            failure: rollback.error,
+          });
+        throw cause;
+      }
+      // Readback failure restores the transaction before reporting.
+      void cause;
       return rollbackOrReadbackFailure(
-        transactionPath,
+        publication,
         original,
         recoveryBackupPath,
       );
     }
-  } catch (cause: unknown) {
-    if (cause instanceof RegularFileCleanupFailure) {
-      const rollback = await restoreConfig(transactionPath, original);
-      if (!rollback.ok)
-        throw new ClientConfigurationCleanupRollbackFailure(cause, {
-          status: "failed",
-          reason: "rollback",
-          ...(recoveryBackupPath === undefined
-            ? {}
-            : { backupPath: recoveryBackupPath }),
-          failure: rollback.error,
-        });
-      throw cause;
-    }
-    // Readback failure restores the transaction before reporting.
-    void cause;
-    return rollbackOrReadbackFailure(
-      transactionPath,
-      original,
-      recoveryBackupPath,
-    );
-  }
-  return {
-    status: "configured",
-    ...(recoveryBackupPath === undefined
-      ? {}
-      : { backupPath: recoveryBackupPath }),
-  };
+    return {
+      status: "configured",
+      ...(recoveryBackupPath === undefined
+        ? {}
+        : { backupPath: recoveryBackupPath }),
+    };
+  });
 };
 
 /** Determine whether an existing client configuration matches the desired registration. */
@@ -630,7 +634,7 @@ const readZcodeFallbackServers = async (
 };
 
 const restoreConfig = async (
-  path: string,
+  publication: ClientConfigurationPublication,
   original: string | undefined,
 ): Promise<
   Result<
@@ -639,20 +643,23 @@ const restoreConfig = async (
   >
 > => {
   try {
-    if (original === undefined) await rm(path, { force: true });
-    else await writeFile(path, original, { encoding: "utf8", mode: 0o600 });
+    await publication.restore(original);
     return ok(undefined);
   } catch (cause: unknown) {
-    return err({ kind: "restore", path, detail: errorDetail(cause) });
+    return err({
+      kind: "restore",
+      path: publication.path,
+      detail: errorDetail(cause),
+    });
   }
 };
 
 const rollbackOrReadbackFailure = async (
-  targetPath: string,
+  publication: ClientConfigurationPublication,
   original: string | undefined,
   backupPath: string | undefined,
 ): Promise<ClientConfigurationResult> => {
-  const rollback = await restoreConfig(targetPath, original);
+  const rollback = await restoreConfig(publication, original);
   return rollback.ok
     ? {
         status: "failed",
@@ -785,9 +792,11 @@ const clientConfigurationDesired = (
 const positiveTimeout = (
   registration: unknown,
   key: string,
-): number | undefined => {
+): number | bigint | undefined => {
   if (typeof registration !== "object" || registration === null) return;
   const value: unknown = Reflect.get(registration, key);
+  // TOML keeps integers beyond the safe Number range exact as bigint.
+  if (typeof value === "bigint") return value > 0n ? value : undefined;
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? value
     : undefined;

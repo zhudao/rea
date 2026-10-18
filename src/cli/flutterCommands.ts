@@ -84,6 +84,7 @@ export const registerFlutterCommands = (
               { close: () => provider.close() },
               "flutter",
               spec.operation,
+              signal,
             ),
           ),
         ),
