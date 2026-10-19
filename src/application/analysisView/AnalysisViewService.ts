@@ -21,9 +21,13 @@ import {
   type InspectAnalysisViewInput,
 } from "../../domain/analysisView/analysisView.js";
 import { jsonValueSchema } from "../../domain/jsonValue.js";
-import { isImmutableJsonSnapshot } from "../../domain/immutableJson.js";
+import {
+  immutableJsonSnapshotMember,
+  isImmutableJsonSnapshot,
+} from "../../domain/immutableJson.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { WebNetworkApiSurfaceAccumulator } from "../../domain/analysisView/WebNetworkApiSurfaceAccumulator.js";
+import { EnvironmentManifestAccumulator } from "../../domain/analysisView/EnvironmentManifestAccumulator.js";
 import { admitAnalysisViewData } from "../../domain/analysisView/analysisViewDataAdmission.js";
 
 /** Authenticate a selected-view request and project already completed Evidence. */
@@ -49,13 +53,22 @@ export const inspectAnalysisViewValidated = (
   input: InspectAnalysisViewInput,
   lookup?: EvidenceLookup,
 ): Result<Evidence, AnalysisError> => {
-  const accumulator =
+  const apiSurfaceAccumulator =
     input.view.kind === "api-surface"
       ? new WebNetworkApiSurfaceAccumulator(
           undefined,
           input.view.include_query_parameter_names === true,
         )
       : undefined;
+  const manifestAccumulator =
+    input.view.kind === "environment-manifest"
+      ? new EnvironmentManifestAccumulator(
+          undefined,
+          input.view.include_query_parameter_names,
+          input.view.template_rules,
+        )
+      : undefined;
+  const accumulator = apiSurfaceAccumulator ?? manifestAccumulator;
   if (input.source.kind === "inline") {
     const admitted =
       accumulator === undefined
@@ -70,7 +83,9 @@ export const inspectAnalysisViewValidated = (
     {
       evidenceId: parent.evidence_id,
       operation: parent.operation,
-      normalizedResult: parent.normalized_result,
+      normalizedResult:
+        immutableJsonSnapshotMember(parent, "normalized_result") ??
+        parent.normalized_result,
       // Sealing an Evidence root deep-freezes it; only the root is registered.
       sealedResult: isImmutableJsonSnapshot(parent),
       subject: parent.subject,
@@ -85,7 +100,8 @@ export const inspectAnalysisViewValidated = (
             },
     },
     input.view,
-    accumulator,
+    apiSurfaceAccumulator,
+    manifestAccumulator,
   );
   if (!projected.ok) return projected;
   if (
@@ -218,8 +234,10 @@ const createAnalysisViewEvidence = (
     result: jsonValueSchema.parse(result),
     rawResult: null,
     confidence:
-      // Paging follows the full grouping, so any templated group makes every page inferred.
-      result.kind === "api-surface" && result.templated_groups > 0
+      // Grouping is whole-capture, so any templated group or parameter makes the result inferred.
+      (result.kind === "api-surface" ||
+        result.kind === "environment-manifest") &&
+      result.templated_groups > 0
         ? "inferred"
         : "derived",
     authority: parent.authority,

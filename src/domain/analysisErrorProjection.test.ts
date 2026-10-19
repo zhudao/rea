@@ -839,7 +839,9 @@ describe("analysis error projection: evidence files", () => {
 });
 
 it("retains the primary failure and both cleanup reports after a secondary failure", () => {
+  const callerReason = { caller: "stop" };
   const primary = new AnalysisCancelledError("execute_rizin_command", {
+    cause: callerReason,
     capturedOutput: {
       stdout: "partial",
       stderr: "diagnostic",
@@ -855,6 +857,8 @@ it("retains the primary failure and both cleanup reports after a secondary failu
   });
   expect(enriched).toBe(primary);
   expect(enriched._tag).toBe("AnalysisCancelledError");
+  expect(enriched.cause).toBe(callerReason);
+  expect(enriched.secondaryFailures).toEqual([secondary]);
   expect(projectAnalysisError(enriched)).toMatchObject({
     code: "cleanup_incomplete",
     details: {
@@ -866,3 +870,40 @@ it("retains the primary failure and both cleanup reports after a secondary failu
     },
   });
 });
+
+it("retains secondary failures when the primary error has no cause", () => {
+  const primary = new AnalysisCancelledError("execute_rizin_command");
+  const secondary = new AnalysisOutputError("open_binary", "cannot rebind");
+
+  primary.retainSecondaryFailure(secondary, {});
+
+  expect(primary.cause).toBeUndefined();
+  expect(primary.secondaryFailures).toEqual([secondary]);
+});
+
+it.each([false, true])(
+  "preserves producer capability recovery with retryable=%s",
+  (retryable) => {
+    const recovery =
+      "Choose an explicit disposition, then retry the same session.";
+    const projected = projectAnalysisError(
+      new AnalysisCapabilityUnavailableError("fixture", "close", "live state", {
+        retryable,
+        remediationAction: recovery,
+      }),
+    );
+    expect(projected).toMatchObject({
+      code: "capability_unavailable",
+      retryable,
+      remediation: { action: recovery },
+      details: {
+        provider_id: "fixture",
+        operation: "close",
+        reason: "live state",
+      },
+    });
+    expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(
+      true,
+    );
+  },
+);

@@ -250,16 +250,6 @@ const persistClientConfiguration = async ({
       };
     if (target.value) return { status: "failed", reason: "target_changed" };
   }
-  let recoveryBackupPath: string | undefined;
-  if (original !== undefined) {
-    const preserved = await preserveCurrentRecoveryBackup(
-      `${client.configPath}.rea.backup`,
-      transactionPath,
-      original,
-    );
-    if (!preserved.ok) return { status: "failed", reason: "backup" };
-    recoveryBackupPath = preserved.value;
-  }
   // A native OpenCode V2 entry replaces REA's legacy V1 entry, which would
   // otherwise conflict with it.
   const legacyPath = legacyClientServerPath(
@@ -292,19 +282,51 @@ const persistClientConfiguration = async ({
           ),
         }
       : registered;
-  let publication: ClientConfigurationPublication;
+  let serialized: ReturnType<typeof serializeClientConfiguration>;
   try {
-    await mkdir(dirname(client.configPath), { recursive: true });
-    publication = await ClientConfigurationPublication.write(
-      transactionPath,
-      serializeClientConfiguration(document, format, original, [
+    serialized = serializeClientConfiguration(
+      document,
+      format,
+      original,
+      [
         ...Object.keys(fallbackServers)
           .filter((name) => name !== PRODUCT_IDENTITY.mcpServerKey)
           .map((name) => clientServerPath(parsed, name)),
         clientServerPath(parsed, PRODUCT_IDENTITY.mcpServerKey),
         ...(legacyPath === undefined ? [] : [legacyPath]),
         ...(enableOmp ? [[OMP_DISABLED_SERVERS_KEY]] : []),
-      ]),
+      ],
+      // Setup deletes only REA's OpenCode V1 name, which the native V2 entry
+      // supersedes whatever its launcher; every repeat goes, as one member does.
+      { removeShadowedMembersAt: legacyPath === undefined ? [] : [legacyPath] },
+    );
+  } catch (cause: unknown) {
+    // An unserializable edit is reported before any file is written.
+    void cause;
+    return { status: "failed", reason: "write" };
+  }
+  if (!serialized.ok)
+    return {
+      status: "failed",
+      reason: "shadowed_member",
+      path: serialized.error.path,
+    };
+  let recoveryBackupPath: string | undefined;
+  if (original !== undefined) {
+    const preserved = await preserveCurrentRecoveryBackup(
+      `${client.configPath}.rea.backup`,
+      transactionPath,
+      original,
+    );
+    if (!preserved.ok) return { status: "failed", reason: "backup" };
+    recoveryBackupPath = preserved.value;
+  }
+  let publication: ClientConfigurationPublication;
+  try {
+    await mkdir(dirname(client.configPath), { recursive: true });
+    publication = await ClientConfigurationPublication.write(
+      transactionPath,
+      serialized.value,
       original,
       0o600,
     );
