@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { WebNetworkCaptureRecord } from "../webNetworkCapture.js";
 import { AnalysisUnsupportedTargetError } from "../analysisErrorCore.js";
 import type { AnalysisError } from "../analysisErrorBase.js";
 import { uniqueSorted } from "../canonicalOrdering.js";
@@ -11,6 +12,7 @@ import type {
 import { EnvironmentManifestAccumulator } from "./EnvironmentManifestAccumulator.js";
 import { TEMPLATE_RULES } from "./environmentManifestRules.js";
 import { admitHarCaptureParent } from "./WebNetworkProjectionAccumulator.js";
+import { admitScenarioCaptureParent } from "./scenarioCaptureRecords.js";
 import { ROUTE_RULES } from "./webNetworkRouteTemplates.js";
 
 export const environmentManifestViewRequestSchema = z.strictObject({
@@ -23,7 +25,7 @@ export const environmentManifestViewRequestSchema = z.strictObject({
     .meta({ uniqueItems: true })
     .default([])
     .describe(
-      "Opt-in template rules applied after the four format rules, each listed at most once: after-uid-literal templates the segment following a literal uid, opaque-token templates long mixed alphanumeric segments, sibling-variance merges groups that differ in one identifier-like segment. Literal sibling folding into existing opt-in parameters also requires sibling-variance. Merged parameters are inferences.",
+      "Opt-in template rules applied after the four format rules, each listed at most once: after-uid-literal templates the segment following a literal uid, opaque-token templates long mixed alphanumeric segments, sibling-variance merges groups that differ in one identifier-like segment, sibling-pair-variance merges groups that differ in two adjacent literals between a plural literal and another literal when at least three distinct pairs vary in both. Literal sibling folding into existing opt-in parameters also requires sibling-variance. Merged parameters are inferences.",
     ),
   include_query_parameter_names: z
     .boolean()
@@ -119,7 +121,45 @@ export const environmentManifestFields = {
     ),
 };
 
-/** Project retained HAR request lines into a replayable tool surface; templates are inferences. */
+/** The records, coverage and identity a manifest projects from, for either parent kind. */
+interface CaptureParent {
+  readonly operation:
+    | "inspect_web_network_capture"
+    | "capture_browser_scenario";
+  readonly records: readonly WebNetworkCaptureRecord[];
+  readonly total_records: number;
+  readonly limitations: readonly string[];
+  readonly artifact: { readonly path: string; readonly sha256: string | null };
+}
+
+/** HAR captures keep their own gate; a browser scenario has no captured file, so its artifact is empty. */
+const admitCaptureParent = (
+  parent: AnalysisViewParent,
+  accumulator: EnvironmentManifestAccumulator,
+): Result<CaptureParent, AnalysisError> => {
+  if (parent.operation === "capture_browser_scenario") {
+    const scenario = admitScenarioCaptureParent(parent, accumulator);
+    return scenario.ok
+      ? ok({
+          operation: "capture_browser_scenario",
+          records: scenario.value.records,
+          total_records: scenario.value.totalRecords,
+          limitations: scenario.value.limitations,
+          artifact: { path: "", sha256: null },
+        })
+      : scenario;
+  }
+  const har = admitHarCaptureParent(
+    parent,
+    "environment-manifest",
+    accumulator,
+  );
+  return har.ok
+    ? ok({ operation: "inspect_web_network_capture", ...har.value })
+    : har;
+};
+
+/** Project retained request lines, from a HAR or a browser scenario, into a replayable tool surface; templates are inferences. */
 export const projectEnvironmentManifestView = (
   parent: AnalysisViewParent,
   view: AnalysisViewRequest,
@@ -136,14 +176,10 @@ export const projectEnvironmentManifestView = (
       new AnalysisUnsupportedTargetError(
         "inspect_analysis_view",
         parent.evidenceId,
-        `View ${view.kind} is unsupported for parent operation ${parent.operation}; environment-manifest requires inspect_web_network_capture.`,
+        `View ${view.kind} is unsupported for parent operation ${parent.operation}; environment-manifest requires inspect_web_network_capture or capture_browser_scenario.`,
       ),
     );
-  const admitted = admitHarCaptureParent(
-    parent,
-    "environment-manifest",
-    accumulator,
-  );
+  const admitted = admitCaptureParent(parent, accumulator);
   if (!admitted.ok) return admitted;
   const capture = admitted.value;
   const limitations = accumulator.addLimitations([
@@ -177,7 +213,7 @@ export const projectEnvironmentManifestView = (
     kind: "environment-manifest",
     view,
     parent_evidence_id: parent.evidenceId,
-    parent_operation: "inspect_web_network_capture",
+    parent_operation: capture.operation,
     parent_digest: parent.evidenceId.slice(3),
     artifact: { path: capture.artifact.path, sha256: capture.artifact.sha256 },
     ...manifest.value,

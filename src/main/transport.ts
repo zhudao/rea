@@ -1,17 +1,18 @@
 import { createAndroidAnalysisProvider } from "../composition/android.js";
 import type { AndroidAnalysisPort } from "../application/android/AndroidAnalysisPort.js";
-import type { StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 
 import type { BinarySession } from "../application/binary/BinarySession.js";
 import type { Logger } from "pino";
 import { createServer } from "../server/createServer.js";
+import { StreamableHttpListenError } from "../server/http/streamableHttpListenError.js";
 import type { ToolResultDelivery } from "../server/toolResult.js";
-import type { RuntimeDependencies } from "./types.js";
+import type { McpServerHandle, RuntimeDependencies } from "./types.js";
 import type { OptionalProviderLoadResult } from "../application/OptionalObservationProviders.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import {
   MCP_CONNECTION_LOST,
   MCP_CONNECTION_START_FAILED,
+  MCP_HTTP_LISTEN_FAILED,
 } from "./messages.js";
 
 interface ServerContext {
@@ -26,6 +27,7 @@ type ClosableOptionalProvider = {
   readonly close?: () => Promise<void>;
 };
 
+/** Start the injected transport (stdio or streamable HTTP) around one shared session. */
 export const startMcpTransport = async (
   dependencies: RuntimeDependencies,
   session: BinarySession,
@@ -33,7 +35,7 @@ export const startMcpTransport = async (
 ): Promise<
   | {
       readonly ok: true;
-      readonly handle: StdioServerHandle;
+      readonly handle: McpServerHandle;
       readonly closeAndroid: () => Promise<void>;
       readonly closeOptionalProviders: () => Promise<void>;
     }
@@ -51,9 +53,9 @@ export const startMcpTransport = async (
       "Optional MCP providers could not load; affected tools remain unavailable",
     );
   }
-  for (const failure of Object.values(
-    optionalProviders.optionalProviderLoadFailures ?? {},
-  )) {
+  const { optionalProviderLoadFailures, ...observationProviders } =
+    optionalProviders;
+  for (const failure of Object.values(optionalProviderLoadFailures ?? {})) {
     serverLogger.warn(
       { providerId: failure.providerId, error: failure.reason },
       "Optional MCP adapter could not load; its peers remain available",
@@ -81,12 +83,9 @@ export const startMcpTransport = async (
   // Optional providers are shared by every server instance the SDK creates,
   // including a discarded discovery probe, so only process shutdown closes them.
   const optionalProvidersToClose = new Set<ClosableOptionalProvider>(
-    [
-      optionalProviders.browserObservation,
-      optionalProviders.browserScenarioCapture,
-      optionalProviders.electronObservation,
-      optionalProviders.electronActiveObservation,
-    ].filter((provider) => provider !== undefined),
+    Object.values(observationProviders).filter(
+      (provider) => provider !== undefined,
+    ),
   );
   let optionalProviderClose: Promise<void> | undefined;
   const closeOptionalProviders = async (): Promise<void> => {
@@ -108,9 +107,9 @@ export const startMcpTransport = async (
     });
     await optionalProviderClose;
   };
-  let handle: StdioServerHandle;
+  let handle: McpServerHandle;
   try {
-    handle = dependencies.serve(
+    handle = await dependencies.serve(
       () => {
         // The SDK can discard a discovery probe and construct a replacement server.
         const android = createAndroidAnalysisProvider(
@@ -142,6 +141,7 @@ export const startMcpTransport = async (
           serverLogger.error(MCP_CONNECTION_LOST);
           dependencies.writeStderr(`${MCP_CONNECTION_LOST}\n`);
         },
+        logger: serverLogger,
       },
     );
   } catch (cause: unknown) {
@@ -156,13 +156,17 @@ export const startMcpTransport = async (
       closeServers(),
       closeOptionalProviders(),
     ]);
+    const startFailure =
+      cause instanceof StreamableHttpListenError
+        ? MCP_HTTP_LISTEN_FAILED
+        : MCP_CONNECTION_START_FAILED;
     serverLogger.error(
       {
         error: cause instanceof Error ? cause.message : String(cause),
       },
-      MCP_CONNECTION_START_FAILED,
+      startFailure,
     );
-    dependencies.writeStderr(`${MCP_CONNECTION_START_FAILED}\n`);
+    dependencies.writeStderr(`${startFailure}\n`);
     if (binaryCleanup.status === "fulfilled" && !binaryCleanup.value.ok) {
       const cleanupError = projectAnalysisError(binaryCleanup.value.error);
       serverLogger.error(
@@ -194,7 +198,11 @@ export const startMcpTransport = async (
   return {
     ok: true,
     handle: {
+      ...(handle.prepareShutdown === undefined
+        ? {}
+        : { prepareShutdown: handle.prepareShutdown }),
       close: async () => {
+        await handle.prepareShutdown?.();
         const results = await Promise.allSettled([
           handle.close(),
           closeServers(),

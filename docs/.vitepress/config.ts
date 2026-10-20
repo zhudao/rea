@@ -29,6 +29,7 @@ export default defineConfig({
         items: [
           { text: "Native binaries", link: "/native-investigation" },
           { text: "Go build metadata", link: "/go-binaries" },
+          { text: "IL2CPP metadata", link: "/il2cpp-metadata" },
           { text: "Rust dependencies", link: "/rust-binaries" },
           {
             text: "JavaScript and Electron",
@@ -43,12 +44,14 @@ export default defineConfig({
             text: "Web network captures",
             link: "/web-network-captures",
           },
+          { text: "Agent environments", link: "/agent-environments" },
           { text: "Electron observation", link: "/electron-observation" },
           { text: "Electron fuses", link: "/electron-fuses" },
           { text: "Process capture", link: "/process-capture" },
           { text: ".NET assemblies", link: "/managed-code-analysis" },
           { text: "Android applications", link: "/android-analysis" },
           { text: "Apple applications", link: "/apple-application-analysis" },
+          { text: "Desktop installations", link: "/desktop-applications" },
           { text: "Firmware", link: "/firmware-analysis" },
           { text: "SQLite databases", link: "/sqlite-databases" },
           { text: "Packet captures", link: "/packet-captures" },

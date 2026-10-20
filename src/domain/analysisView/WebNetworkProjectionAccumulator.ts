@@ -69,6 +69,11 @@ export abstract class WebNetworkProjectionAccumulator {
     );
   }
 
+  /** Reserve bytes a view derives from the borrowed parent before it allocates them. */
+  admitDerivedBytes(bytes: number): Result<void, AnalysisError> {
+    return this.retain(bytes) ? ok(undefined) : this.overBudget();
+  }
+
   /** Admit the complete portable envelope before cloning or authenticating it. */
   admitInlineEvidence(value: unknown): Result<void, AnalysisError> {
     return admitAnalysisViewData(value, true, (bytes) =>
@@ -107,7 +112,7 @@ export const admitHarCaptureParent = (
     );
   if (parent.operation !== "inspect_web_network_capture")
     return unsupported(
-      `View ${viewKind} is unsupported for parent operation ${parent.operation}; ${viewKind} requires inspect_web_network_capture.`,
+      `View ${viewKind} is unsupported for parent operation ${parent.operation}; ${viewKind} requires ${viewKind === "environment-manifest" ? "inspect_web_network_capture or capture_browser_scenario" : "inspect_web_network_capture"}.`,
     );
   const admitted = accumulator.admitCaptureClone(parent.normalizedResult);
   if (!admitted.ok) return admitted;

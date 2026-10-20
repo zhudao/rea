@@ -1,3 +1,6 @@
+import { hasGodotPckHeader } from "../../domain/godotPckFormat.js";
+import type { ArtifactClassificationEvidence } from "../ArtifactClassificationProbe.js";
+import { ArtifactReaderFailure } from "../ArtifactReader.js";
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 import { isJavaScriptSourcePath } from "../../domain/javascript/javascriptArtifactFiles.js";
 import { digestCanonicalValue } from "../../domain/canonicalDigest.js";
@@ -47,6 +50,8 @@ export interface MutableOccurrence {
   encrypted: boolean;
   hash_status: ArtifactOccurrence["hash_status"];
   source_location: ArtifactOccurrence["source_location"];
+  declared_integrity?: NonNullable<ArtifactOccurrence["declared_integrity"]>;
+  format_metadata?: NonNullable<ArtifactOccurrence["format_metadata"]>;
   limitations: string[];
 }
 
@@ -105,10 +110,18 @@ export const createOccurrence = (
     encrypted: entry.encrypted,
     hash_status: entry.encrypted ? "unavailable" : "not-hashed",
     source_location:
-      entry.byteOffset === null || entry.declaredSize === null
+      entry.encrypted ||
+      entry.byteOffset === null ||
+      entry.declaredSize === null
         ? null
         : { offset: entry.byteOffset, length: entry.declaredSize },
     limitations: [...entry.limitations],
+    ...(entry.declaredIntegrity === null
+      ? {}
+      : { declared_integrity: { ...entry.declaredIntegrity } }),
+    ...(entry.formatMetadata === undefined
+      ? {}
+      : { format_metadata: { ...entry.formatMetadata } }),
   };
 };
 
@@ -229,6 +242,7 @@ export const rootOccurrenceFor = (
     readonly executable: boolean;
     readonly format: ArtifactOccurrence["artifact_format"];
     readonly path: string;
+    readonly formatMetadata?: ArtifactOccurrence["format_metadata"];
   },
 ): MutableOccurrence => ({
   occurrence_id: occurrenceIdForLocation({
@@ -243,16 +257,21 @@ export const rootOccurrenceFor = (
   artifact_kind:
     metadata.format === "directory" ||
     isZipPackageFormat(metadata.format) ||
-    ["asar", "dmg", "pkg"].includes(metadata.format)
+    ["asar", "godot-pck", "dmg", "pkg"].includes(metadata.format)
       ? "container"
       : artifactRoleForFormat(metadata.path, metadata.format).kind,
   artifact_format: metadata.format,
   declared_size: metadata.size,
   compressed_size: null,
   executable: metadata.executable,
-  encrypted: false,
+  encrypted:
+    metadata.formatMetadata?.kind === "godot-pck" &&
+    metadata.formatMetadata.directory_status === "encrypted",
   hash_status: "verified",
   source_location: null,
+  ...(metadata.formatMetadata === undefined
+    ? {}
+    : { format_metadata: metadata.formatMetadata }),
   limitations: [],
 });
 
@@ -473,12 +492,13 @@ export const classifyArtifactPath = (
 /** Classify executable formats from bytes while retaining path-specific roles. */
 export const classifyArtifactContent = (
   path: string,
-  prefix: Buffer,
-  fileSize = prefix.length,
+  evidence: ArtifactClassificationEvidence,
+  fileSize = evidence.prefix.length,
 ): {
   readonly kind: ArtifactOccurrence["artifact_kind"];
   readonly format: ArtifactOccurrence["artifact_format"];
 } => {
+  const { prefix, asarHeader } = evidence;
   const format = classifyArtifactBytes(prefix, fileSize);
   const byPath = classifyArtifactPath(path);
   if (
@@ -491,25 +511,17 @@ export const classifyArtifactContent = (
   if (
     format === "file" &&
     path.toLowerCase().endsWith(".asar") &&
-    hasAsarHeader(prefix)
-  )
-    return { kind: "container", format: "asar" };
+    asarHeader.state !== "rejected"
+  ) {
+    if (asarHeader.state === "limit")
+      throw new ArtifactReaderFailure(
+        "limit",
+        "ASAR header exceeds the bounded classification or decode budget",
+      );
+    if (asarHeader.state === "matched")
+      return { kind: "container", format: "asar" };
+  }
   return artifactRoleForFormat(path, format);
-};
-
-/**
- * Electron ASAR starts with a size pickle whose payload is one uint32, then
- * a header pickle whose payload begins with a JSON object.
- */
-export const hasAsarHeader = (prefix: Buffer): boolean => {
-  if (prefix.length < 17 || prefix.readUInt32LE(0) !== 4) return false;
-  const headerSize = prefix.readUInt32LE(4);
-  const payloadSize = prefix.readUInt32LE(8);
-  if (headerSize < 16 || payloadSize !== headerSize - 4) return false;
-  const stringLength = prefix.readUInt32LE(12);
-  return (
-    stringLength >= 2 && stringLength <= payloadSize - 4 && prefix[16] === 0x7b
-  );
 };
 
 const artifactRoleForFormat = (
@@ -525,6 +537,7 @@ const artifactRoleForFormat = (
       format: zipPackageFormatForPath(path) ?? format,
     };
   if (format === "plist") return { kind: "plist", format };
+  if (format === "godot-pck") return { kind: "container", format };
   return {
     kind: ["native-addon", "dynamic-library"].includes(byPath.kind)
       ? byPath.kind
@@ -539,6 +552,7 @@ export const classifyArtifactBytes = (
   fileSize = prefix.length,
 ): ArtifactNode["format"] => {
   if (hasZipSignature(prefix)) return "zip";
+  if (hasGodotPckHeader(prefix)) return "godot-pck";
   if (hasBinaryPlistSignature(prefix)) return "plist";
   if (hasXmlPlistSignature(prefix)) return "plist";
   const fatFormat = classifyFatArtifact(prefix, fileSize);

@@ -1,3 +1,4 @@
+import { artifactIntegrityDetails } from "../domain/artifactIntegrity.js";
 import { constants, createWriteStream, type Stats } from "node:fs";
 import {
   lstat,
@@ -63,7 +64,7 @@ export class AsarArtifactReader implements ArtifactReader {
         const snapshotPath = this.#snapshotPath();
         this.#resetArchiveState();
         this.#entries.clear();
-        const admitted = await this.#admitHeader(snapshotPath);
+        const admitted = await this.#admitHeader(snapshotPath, signal);
         this.#archiveSize = admitted.archiveBytes;
         this.#headerSize = admitted.headerBytes;
         abortIfNeeded(signal);
@@ -100,11 +101,11 @@ export class AsarArtifactReader implements ArtifactReader {
         executable: metadata.executable === true,
         encrypted: false,
         byteOffset: null,
-        declaredSha256:
+        declaredIntegrity:
           metadata.integrity !== undefined &&
           metadata.integrity.algorithm === "SHA256" &&
           /^[a-f0-9]{64}$/u.test(metadata.integrity.hash)
-            ? metadata.integrity.hash
+            ? { algorithm: "sha256", digest: metadata.integrity.hash }
             : null,
         unpacked: "unpacked" in metadata && metadata.unpacked === true,
         limitations:
@@ -122,7 +123,7 @@ export class AsarArtifactReader implements ArtifactReader {
     }
   }
 
-  async #admitHeader(snapshotPath: string) {
+  async #admitHeader(snapshotPath: string, signal?: AbortSignal) {
     const headerHandle = await this.#openOwned(
       snapshotPath,
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -134,7 +135,10 @@ export class AsarArtifactReader implements ArtifactReader {
         }
       | { readonly ok: false; readonly cause: unknown };
     try {
-      admission = { ok: true, value: await admitAsarHeader(headerHandle) };
+      admission = {
+        ok: true,
+        value: await admitAsarHeader(headerHandle, signal),
+      };
     } catch (cause: unknown) {
       admission = { ok: false, cause };
     }
@@ -478,12 +482,12 @@ export class AsarArtifactReader implements ArtifactReader {
           "integrity",
           `ASAR unpacked entry changed before read: ${entry.path}`,
           {},
-          {
-            logicalPath: entry.path,
-            declaredSha256: entry.declaredSha256,
-            calculatedSha256: null,
-            unpacked: true,
-          },
+          artifactIntegrityDetails(
+            entry.path,
+            entry.declaredIntegrity,
+            null,
+            true,
+          ),
         );
       }
       abortIfNeeded(signal);
@@ -633,12 +637,7 @@ const asarUnpackedEntryFailure = (
       "unavailable",
       `ASAR unpacked entry bytes are unavailable: ${entry.path}`,
       { cause },
-      {
-        logicalPath: entry.path,
-        declaredSha256: entry.declaredSha256,
-        calculatedSha256: null,
-        unpacked: true,
-      },
+      artifactIntegrityDetails(entry.path, entry.declaredIntegrity, null, true),
     );
   return asarFailure(archivePath, `read ${entry.path}`, cause);
 };

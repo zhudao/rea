@@ -57,7 +57,9 @@ export const CLI_COMMANDS = Object.freeze({
   debugWithGdb: "debug-with-gdb",
   debugWithRizin: "debug-with-rizin",
 
+  inspectDesktopApplication: "inspect-desktop-application",
   inspectGoBinary: "inspect-go-binary",
+  inspectIl2cppMetadata: "inspect-il2cpp-metadata",
   inspectRustBinary: "inspect-rust-binary",
   inspectPeResources: "inspect-pe-resources",
   inspectAnalysisView: "inspect-analysis-view",
@@ -122,6 +124,8 @@ export const CLI_COMMANDS = Object.freeze({
   demangleSwift: "demangle-swift",
   evidenceImport: "evidence-import",
   evidenceExport: "evidence-export",
+  environmentServe: "environment-serve",
+  environmentExport: "environment-export",
   compare: "compare",
   captureProcess: "capture-process",
   compareProcessCaptures: "compare-process-captures",

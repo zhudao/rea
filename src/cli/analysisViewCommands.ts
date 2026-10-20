@@ -1,6 +1,6 @@
 import { z } from "incur";
 
-import { inspectAnalysisViewValidated } from "../application/analysisView/AnalysisViewService.js";
+import { inspectAnalysisViewValidatedWithFiles } from "../application/analysisView/AnalysisViewService.js";
 import { readEvidenceBundle } from "../application/EvidenceBundleFiles.js";
 import { inspectEvidenceBundle } from "../application/investigation/InspectEvidenceBundle.js";
 import {
@@ -8,7 +8,7 @@ import {
   importEvidenceBundleInputSchema,
 } from "../contracts/sessionToolSchemas.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
-import { parseCliJsonInput } from "../cliJsonInput.js";
+import { parseCliJsonInput, resolveCliJsonPaths } from "../cliJsonInput.js";
 import { logCliCommand } from "../cliLogging.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
@@ -71,7 +71,7 @@ export const registerAnalysisViewCommands = (
   });
   cli.command(CLI_COMMANDS.inspectAnalysisView, {
     description:
-      "Project a selected view of completed binary-layout, JavaScript application, native function, artifact-inventory, WASM, Mach-O, Interface Builder, EVM, managed, Android package, Dart AOT, web network capture or pcap Evidence JSON",
+      "Project a selected view of completed binary-layout, JavaScript application, native function, artifact-inventory, desktop-directory, WASM, Mach-O, Interface Builder, EVM, managed, Android package, Dart AOT, web network capture or pcap Evidence JSON",
     args: z.object({
       inputJson: z.string().describe("Inline workflow JSON or JSON file path"),
     }),
@@ -82,7 +82,9 @@ export const registerAnalysisViewCommands = (
           CLI_COMMANDS.inspectAnalysisView,
         );
         if (!input.ok) return input.error;
-        const parsed = inspectAnalysisViewInputSchema.safeParse(input.value);
+        // An evidence-file path is resolved against the operator's working directory.
+        const value = resolveCliJsonPaths(input.value, [["source", "path"]]);
+        const parsed = inspectAnalysisViewInputSchema.safeParse(value);
         if (!parsed.success)
           return {
             error: "Application workflow failed",
@@ -90,11 +92,11 @@ export const registerAnalysisViewCommands = (
               analysisInputErrorFromIssues(
                 CLI_COMMANDS.inspectAnalysisView,
                 parsed.error.issues,
-                input.value,
+                value,
               ),
             ),
           };
-        const result = inspectAnalysisViewValidated(parsed.data);
+        const result = await inspectAnalysisViewValidatedWithFiles(parsed.data);
         return result.ok
           ? jsonValueSchema.parse(result.value)
           : {

@@ -1,3 +1,4 @@
+import { projectArtifactIntegrityDetails } from "./artifactIntegrity.js";
 import { jsonValueSchema, type JsonValue } from "./jsonValue.js";
 import { isImmutableJsonSnapshot } from "./immutableJson.js";
 
@@ -52,7 +53,13 @@ export const projectAnalysisError = (
 ): AnalysisErrorProjection => {
   const composed = error;
   error = resolvedAnalysisError(error);
-  const diagnostics = error.diagnostics;
+  let diagnosticSource = error;
+  while (
+    diagnosticSource.diagnostics === undefined &&
+    diagnosticSource.cleanupPrimary !== undefined
+  )
+    diagnosticSource = diagnosticSource.cleanupPrimary;
+  const diagnostics = diagnosticSource.diagnostics;
   const capturedOutput = composed.capturedOutput ?? error.capturedOutput;
   const partialObservation =
     composed.partialObservation ?? error.partialObservation;
@@ -62,6 +69,9 @@ export const projectAnalysisError = (
   const primaryDetails = errorDetails(error);
   const details = {
     ...primaryDetails,
+    ...(composed === error || composed.cleanupReport === undefined
+      ? {}
+      : { cleanup_report: jsonValueSchema.parse(composed.cleanupReport) }),
     ...(diagnostics === undefined ? {} : { diagnostics }),
     ...(composed === error || composed.diagnostics === undefined
       ? {}
@@ -326,12 +336,7 @@ const artifactStateErrorDetails = (
   error: AnalysisError,
 ): Readonly<Record<string, JsonValue>> | undefined => {
   if (error instanceof ArtifactOperationError && error.artifactDetails)
-    return {
-      logical_path: error.artifactDetails.logicalPath,
-      declared_sha256: error.artifactDetails.declaredSha256,
-      calculated_sha256: error.artifactDetails.calculatedSha256,
-      unpacked: error.artifactDetails.unpacked,
-    };
+    return projectArtifactIntegrityDetails(error.artifactDetails);
   if (error instanceof ArtifactOperationError)
     return {
       operation: error.operation,
@@ -345,6 +350,14 @@ const artifactStateErrorDetails = (
       operation: error.operation,
       reason: error.reason,
       ...(error.path === undefined ? {} : { path: error.path }),
+      ...(error.contentIssues === undefined
+        ? {}
+        : {
+            content_issues: error.contentIssues.map((issue) => ({
+              ...issue,
+              path: [...issue.path],
+            })),
+          }),
       ...(error.published === undefined
         ? {}
         : {
