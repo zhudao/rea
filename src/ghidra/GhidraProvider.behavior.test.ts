@@ -1142,7 +1142,7 @@ describe("Ghidra client projection", () => {
         },
         analysisProfile: resolved.value.profile,
         result: [{ address: "0x1000", value: "fixture_main" }],
-        rawResult: [{ procedure: { external: false, thunk: false } }],
+        rawResult: null,
       },
     });
     expect(startCount).toBe(0);
@@ -1181,10 +1181,7 @@ describe("Ghidra result projection", () => {
     if (!execution.ok) throw execution.error;
     expect(execution.value.result).toBe("void main() {}");
     expect(execution.value.limitations).toContain(limitation);
-    expect(execution.value.rawResult).toEqual({
-      value: "void main() {}",
-      limitations: [limitation],
-    });
+    expect(execution.value.rawResult).toBeNull();
     await client.close();
   });
 
@@ -1298,6 +1295,52 @@ describe("Ghidra result projection", () => {
       ok: false,
       error: { _tag: "AnalysisCancelledError", operation: "open_binary" },
     });
+  });
+});
+
+describe("Ghidra decompiler failure projection", () => {
+  it("reports a procedure decompiler failure without blaming the environment", async () => {
+    const code = "decompile_failed";
+    const message =
+      "Ghidra decompilation failed: Low-level Error: Fixture decompiler failure";
+    const ghidra = provider(installationHost(), () => ({
+      start: () => Promise.resolve(ok(sessionInfo())),
+      callTool: () =>
+        Promise.resolve(
+          err(
+            new GhidraSessionError(
+              "remote",
+              message,
+              { remote_code: code },
+              { remoteCode: code },
+            ),
+          ),
+        ),
+      close: () => Promise.resolve(ok(null)),
+    }));
+    const client = await createElfClient(ghidra);
+    const result = await client.execute("procedure_pseudo_code", {
+      procedure: "main",
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "ProviderAdapterError" },
+    });
+    if (!result.ok) {
+      const projected = projectAnalysisError(result.error);
+      expect(projected).toMatchObject({
+        code: "execution_failure",
+        retryable: false,
+        message: `${message}. Only the decompiler failed for this procedure; the Ghidra session remains usable.`,
+        details: { diagnostics: { remote_code: code } },
+      });
+      expect(projected.message).not.toContain("rea doctor");
+      expect(projected.remediation.action).toContain("analyze_function");
+      expect(projected.remediation.action).toContain(
+        "facet_availability.pseudocode",
+      );
+      expect(projected.remediation.action).not.toContain("rea doctor");
+    }
   });
 });
 
@@ -1672,6 +1715,7 @@ it("returns read-only NativeAOT metadata inline and drills down by derived Metho
     expect(detail).toMatchObject({
       ok: true,
       value: {
+        rawResult: unavailableNativeAotDatabaseType("0x140002280"),
         result: {
           status: "unavailable",
           source: "analysis-database",
@@ -2932,6 +2976,12 @@ describe("Ghidra deadline guidance", () => {
     );
     expect(projected.remediation.action).toContain(
       "REA_GHIDRA_DISABLED_ANALYZERS",
+    );
+    expect(projected.remediation.action).toContain("restart REA");
+    expect(projected.remediation.action).toContain("reconnect the MCP client");
+    expect(projected.remediation.action).toContain("export useful Evidence");
+    expect(projected.remediation.action).toContain(
+      "Reopening alone keeps the current server settings",
     );
     expect(projected.remediation.action).not.toContain("rea doctor");
   });

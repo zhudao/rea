@@ -3,9 +3,371 @@ import { describe, expect, it } from "vitest";
 import { SUPPORTED_NODE_VERSION_PROSE } from "../domain/runtimeVersion.js";
 import type { ClientRegistrationStatus } from "./ClientRegistrationStatus.js";
 import { createDoctorHostFixture as host } from "./Doctor.fixture.js";
-import { runDoctor } from "./Doctor.js";
+import { runDoctor, systemDoctorHost, type DoctorHost } from "./Doctor.js";
 import { err } from "../domain/result.js";
 import { HopperReleaseError } from "./HopperReleaseFeed.js";
+
+describe("doctor Hopper startup timeout", () => {
+  const timeoutHost = (
+    value: string | undefined,
+    overrides: Partial<DoctorHost> = {},
+  ): DoctorHost => ({
+    ...systemDoctorHost({
+      environment:
+        value === undefined ? {} : { REA_HOPPER_STARTUP_TIMEOUT_MS: value },
+    }),
+    ...host({
+      installationPaths: () => Promise.resolve([]),
+      clientRegistrations: () => Promise.resolve([]),
+      ...overrides,
+    }),
+  });
+
+  it.each([
+    ["0", true, false],
+    ["120000", true, true],
+    ["0", false, false],
+    ["120000", false, true],
+    [undefined, false, true],
+  ] as const)(
+    "checks timeout %s with Hopper present=%s and an available peer",
+    async (value, hopperPresent, healthy) => {
+      const selectedHost = timeoutHost(value, {
+        executable: () => Promise.resolve(hopperPresent),
+        providerInspections: () =>
+          Promise.resolve([
+            {
+              id: "ghidra",
+              configured: true,
+              available: true,
+              providerVersion: null,
+              registrationEnvironment: {},
+              checks: [],
+            },
+          ]),
+      });
+      const result = await runDoctor(undefined, selectedHost);
+      expect(result.healthy).toBe(healthy);
+      expect(result.environment_healthy).toBe(healthy);
+      const timeoutCheck = result.checks.find(
+        ({ name }) => name === "hopper-startup-timeout",
+      );
+      if (value === undefined) expect(timeoutCheck).toBeUndefined();
+      else expect(timeoutCheck).toMatchObject({ ok: value !== "0" });
+    },
+  );
+
+  it.each(["", "0", "-1", "1.5", "1e3", "invalid", "2147483648"])(
+    "rejects invalid Hopper startup timeout %j in the selected provider scope",
+    async (value) => {
+      const selectedHost = timeoutHost(value);
+      const result = await runDoctor(undefined, selectedHost, {
+        providers: ["hopper"],
+      });
+
+      expect(result.healthy).toBe(false);
+      expect(result.scope_checks).toContainEqual(
+        expect.objectContaining({
+          name: "hopper-startup-timeout",
+          ok: false,
+          classification: "config_drift",
+          detail: expect.stringContaining("REA_HOPPER_STARTUP_TIMEOUT_MS"),
+          remediation: expect.stringContaining("REA_HOPPER_STARTUP_TIMEOUT_MS"),
+        }),
+      );
+    },
+  );
+
+  it.each([undefined, "1", "120000", "2147483647"])(
+    "keeps Hopper ready with the valid startup timeout %j",
+    async (value) => {
+      const selectedHost = timeoutHost(value);
+      expect(
+        (await runDoctor(undefined, selectedHost, { providers: ["hopper"] }))
+          .healthy,
+      ).toBe(true);
+    },
+  );
+
+  it("keeps an invalid Hopper timeout informational when no provider is selected", async () => {
+    const selectedHost = timeoutHost("0");
+    const result = await runDoctor(undefined, selectedHost, { providers: [] });
+    expect(result.healthy).toBe(true);
+    expect(result.informational_checks).toContainEqual(
+      expect.objectContaining({
+        name: "hopper-startup-timeout",
+        ok: false,
+      }),
+    );
+  });
+
+  it("requires an invalid Hopper timeout for a ready non-Hopper provider", async () => {
+    const ghidra = {
+      providerInspections: () =>
+        Promise.resolve([
+          {
+            id: "ghidra" as const,
+            configured: true,
+            available: true,
+            providerVersion: "12.1.4",
+            registrationEnvironment: { GHIDRA_INSTALL_DIR: "/tools/ghidra" },
+            checks: [
+              {
+                name: "configuration",
+                ok: true,
+                code: null,
+                detail: "/tools/ghidra",
+                remediation: null,
+                classification: "config_drift" as const,
+              },
+            ],
+          },
+        ]),
+    };
+    const blocked = await runDoctor(undefined, timeoutHost("abc", ghidra), {
+      providers: ["ghidra"],
+    });
+    expect(blocked.healthy).toBe(false);
+    expect(blocked.scope_checks).toContainEqual(
+      expect.objectContaining({
+        name: "hopper-startup-timeout",
+        ok: false,
+        classification: "config_drift",
+      }),
+    );
+    expect(
+      blocked.scope_checks.filter(
+        ({ name }) => name === "hopper-startup-timeout",
+      ),
+    ).toHaveLength(1);
+
+    const ready = await runDoctor(undefined, timeoutHost("120000", ghidra), {
+      providers: ["ghidra"],
+    });
+    expect(ready.healthy).toBe(true);
+    expect(ready.scope_checks).toContainEqual(
+      expect.objectContaining({ name: "hopper-startup-timeout", ok: true }),
+    );
+  });
+});
+
+describe("doctor native analysis configuration", () => {
+  const configurationHost = (
+    environment: Readonly<NodeJS.ProcessEnv>,
+  ): DoctorHost => ({
+    ...systemDoctorHost({ environment: { ...environment } }),
+    ...host({
+      installationPaths: () => Promise.resolve([]),
+      clientRegistrations: () => Promise.resolve([]),
+    }),
+  });
+
+  it.each([
+    ["REA_ANALYSIS_PROVIDER", "Hopper"],
+    ["REA_GHIDRA_STARTUP_TIMEOUT_MS", "abc"],
+    ["REA_SWIFTC_COMPILE_TIMEOUT_MS", "0"],
+    ["REA_LOG_LEVEL", "verbose"],
+    ["REA_GHIDRA_COMPILER_SPEC_ID", "gcc"],
+  ] as const)(
+    "rejects %s before scoped Hopper readiness reports success",
+    async (setting, value) => {
+      const result = await runDoctor(
+        undefined,
+        configurationHost({ [setting]: value }),
+        { providers: ["hopper"] },
+      );
+
+      expect(result.healthy).toBe(false);
+      expect(result.environment_healthy).toBe(false);
+      expect(result.scope_checks).toContainEqual(
+        expect.objectContaining({
+          name: `runtime-configuration:${setting}`,
+          ok: false,
+          classification: "config_drift",
+          detail: expect.stringContaining(setting),
+          remediation: expect.stringContaining(setting),
+          details: { setting },
+        }),
+      );
+    },
+  );
+
+  it("keeps a lowercase provider preference ready for the selected engine", async () => {
+    const result = await runDoctor(
+      undefined,
+      configurationHost({ REA_ANALYSIS_PROVIDER: "hopper" }),
+      { providers: ["hopper"] },
+    );
+
+    expect(result.healthy).toBe(true);
+    expect(
+      result.checks.some(({ name }) =>
+        name.startsWith("runtime-configuration:"),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps an invalid native setting informational when nothing starts MCP", async () => {
+    const result = await runDoctor(
+      undefined,
+      configurationHost({ REA_GHIDRA_STARTUP_TIMEOUT_MS: "abc" }),
+      { providers: [] },
+    );
+
+    expect(result.healthy).toBe(true);
+    expect(result.environment_healthy).toBe(false);
+    expect(result.scope_checks.map(({ name }) => name)).not.toContain(
+      "runtime-configuration:REA_GHIDRA_STARTUP_TIMEOUT_MS",
+    );
+    expect(result.informational_checks).toContainEqual(
+      expect.objectContaining({
+        name: "runtime-configuration:REA_GHIDRA_STARTUP_TIMEOUT_MS",
+        ok: false,
+      }),
+    );
+  });
+
+  it("does not treat a JEB-only timeout as native analysis configuration", async () => {
+    const result = await runDoctor(
+      undefined,
+      configurationHost({ REA_JEB_MCP_TIMEOUT_MS: "abc" }),
+      { providers: ["hopper"] },
+    );
+
+    expect(result.healthy).toBe(true);
+    expect(
+      result.checks.some(({ name }) =>
+        name.startsWith("runtime-configuration:"),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("doctor MCP startup readiness", () => {
+  const configurationHost = (
+    environment: Readonly<NodeJS.ProcessEnv>,
+  ): DoctorHost => ({
+    ...systemDoctorHost({ environment: { ...environment } }),
+    ...host({
+      installationPaths: () => Promise.resolve([]),
+      clientRegistrations: () => Promise.resolve([]),
+    }),
+  });
+  const alignedCodex: ClientRegistrationStatus = {
+    client: "codex",
+    config_path: "/home/user/.codex/config.toml",
+    command: ["/current/rea", "mcp"],
+    state: "aligned",
+    remediation: null,
+  };
+  const selectedHost = (
+    environment: Readonly<NodeJS.ProcessEnv>,
+  ): DoctorHost => ({
+    ...configurationHost(environment),
+    clientRegistrations: () => Promise.resolve([alignedCodex]),
+  });
+
+  it("requires an invalid log level for a client and for the skill", async () => {
+    const client = await runDoctor(
+      undefined,
+      selectedHost({
+        REA_LOG_LEVEL: "verbose",
+        REA_GHIDRA_STARTUP_TIMEOUT_MS: "abc",
+      }),
+      { clients: ["codex"] },
+    );
+    expect(client.healthy).toBe(false);
+    expect(client.scope_checks).toContainEqual(
+      expect.objectContaining({
+        name: "runtime-configuration:REA_LOG_LEVEL",
+        ok: false,
+        details: { setting: "REA_LOG_LEVEL" },
+      }),
+    );
+    expect(client.scope_checks).toContainEqual(
+      expect.objectContaining({
+        name: "runtime-configuration:REA_GHIDRA_STARTUP_TIMEOUT_MS",
+        ok: false,
+      }),
+    );
+    expect(client.scope_checks).toContainEqual(
+      expect.objectContaining({ name: "registration:codex", ok: true }),
+    );
+
+    const skill = await runDoctor(
+      undefined,
+      selectedHost({
+        REA_LOG_LEVEL: "verbose",
+        REA_GHIDRA_STARTUP_TIMEOUT_MS: "abc",
+      }),
+      { skill: true },
+    );
+    expect(skill.healthy).toBe(false);
+    expect(skill.scope_checks).toContainEqual(
+      expect.objectContaining({
+        name: "runtime-configuration:REA_LOG_LEVEL",
+        ok: false,
+      }),
+    );
+    expect(skill.scope_checks.map(({ name }) => name)).not.toContain(
+      "runtime-configuration:REA_GHIDRA_STARTUP_TIMEOUT_MS",
+    );
+  });
+
+  it("requires every MCP startup failure for an aligned client", async () => {
+    const ghidraTimeout = await runDoctor(
+      undefined,
+      selectedHost({ REA_GHIDRA_STARTUP_TIMEOUT_MS: "abc" }),
+      { clients: ["codex"] },
+    );
+    expect(ghidraTimeout.healthy).toBe(false);
+    expect(ghidraTimeout.scope_checks).toContainEqual(
+      expect.objectContaining({
+        name: "runtime-configuration:REA_GHIDRA_STARTUP_TIMEOUT_MS",
+        ok: false,
+      }),
+    );
+    expect(ghidraTimeout.scope_checks).toContainEqual(
+      expect.objectContaining({ name: "registration:codex", ok: true }),
+    );
+
+    const hopperTimeout = await runDoctor(
+      undefined,
+      selectedHost({ REA_HOPPER_STARTUP_TIMEOUT_MS: "abc" }),
+      { clients: ["codex"] },
+    );
+    expect(hopperTimeout.healthy).toBe(false);
+    expect(
+      hopperTimeout.scope_checks.filter(
+        ({ name }) => name === "hopper-startup-timeout",
+      ),
+    ).toHaveLength(1);
+
+    const hopperAndClient = await runDoctor(
+      undefined,
+      selectedHost({ REA_HOPPER_STARTUP_TIMEOUT_MS: "abc" }),
+      { clients: ["codex"], providers: ["hopper"] },
+    );
+    expect(
+      hopperAndClient.scope_checks.filter(
+        ({ name }) => name === "hopper-startup-timeout",
+      ),
+    ).toHaveLength(1);
+
+    const skill = await runDoctor(
+      undefined,
+      selectedHost({ REA_GHIDRA_STARTUP_TIMEOUT_MS: "abc" }),
+      { skill: true },
+    );
+    expect(skill.healthy).toBe(true);
+    expect(skill.informational_checks).toContainEqual(
+      expect.objectContaining({
+        name: "runtime-configuration:REA_GHIDRA_STARTUP_TIMEOUT_MS",
+        ok: false,
+      }),
+    );
+  });
+});
 
 describe("doctor runtime check", () => {
   it("reports Node 25 as unsupported", async () => {

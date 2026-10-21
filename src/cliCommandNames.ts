@@ -4,6 +4,7 @@ export const CLI_COMMANDS = Object.freeze({
   inspectPacketCapture: "inspect-packet-capture",
   inspectSignalDecoders: "inspect-signal-decoders",
   decodeSignalRecording: "decode-signal-recording",
+  matchNativeFunctions: "match-native-functions",
   compareWasmInterfaces: "compare-wasm-interfaces",
   inspectWasmArtifact: "inspect-wasm-artifact",
   inspectSqliteDatabase: "inspect-sqlite-database",
@@ -60,6 +61,7 @@ export const CLI_COMMANDS = Object.freeze({
   inspectDesktopApplication: "inspect-desktop-application",
   inspectGoBinary: "inspect-go-binary",
   inspectIl2cppMetadata: "inspect-il2cpp-metadata",
+  inspectModelArtifact: "inspect-model-artifact",
   inspectRustBinary: "inspect-rust-binary",
   inspectPeResources: "inspect-pe-resources",
   inspectAnalysisView: "inspect-analysis-view",
@@ -191,6 +193,8 @@ export const CLI_COMMAND_TOOL_ALIASES = Object.freeze({
 
 /** MCP operations without a dedicated CLI command or direct command alias. */
 export const MCP_TOOLS_WITHOUT_DEDICATED_CLI = Object.freeze([
+  // MCP session control selects a resource root; CLI resource commands take paths directly.
+  "open_bundle_resources",
   "address_name",
   "comment",
   "current_address",

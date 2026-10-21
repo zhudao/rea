@@ -13,6 +13,8 @@ import {
 } from "../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import { bindArtifactFileCleanup } from "../artifacts/ArtifactFileOperation.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import {
   OwnedCommandFailure,
   runOwnedCommand,
@@ -31,6 +33,7 @@ import type {
 } from "../process/ProviderProcess.js";
 import {
   kunaChildEnvironment,
+  kunaInstallationFailureDiagnostics,
   type KunaInstallation,
 } from "./KunaInstallation.js";
 import type { KunaDeadline } from "./KunaConfiguration.js";
@@ -99,21 +102,23 @@ export const kunaFileCleanupError = (
   failure: RegularFileCleanupFailure,
   operation: string,
 ): AnalysisError => {
-  const cleanup = new ProviderCleanupError(
-    KUNA_PROVIDER_ID,
-    [failure.path],
-    { reason: message(failure.cleanupCause) },
-    { cause: failure, operation },
-  );
+  const diagnostics = kunaInstallationFailureDiagnostics(failure);
   const cancellation = regularFileCancellation(failure);
   if (cancellation !== undefined)
     return new AnalysisCancelledError(operation, {
       cause: cancellation.reason,
+      diagnostics,
       cleanup: {
         reason: message(failure.cleanupCause),
         resources: [failure.path],
       },
     });
+  const cleanup = new ProviderCleanupError(
+    KUNA_PROVIDER_ID,
+    [failure.path],
+    { reason: message(failure.cleanupCause), ...diagnostics },
+    { cause: failure, operation },
+  );
   if (failure.outcome.kind === "completed") return cleanup;
   const primaryCause = failure.outcome.cause;
   const primary =
@@ -121,9 +126,31 @@ export const kunaFileCleanupError = (
       ? primaryCause
       : new ProviderAdapterError(KUNA_PROVIDER_ID, operation, {
           cause: primaryCause,
+          diagnostics,
           userMessage: `Kuna ${operation} failed: ${message(primaryCause)}`,
         });
   return analysisErrorWithCleanupFailure(primary, cleanup, operation);
+};
+
+/** Preserve the exact retryable resources when an inspection admission retries them. */
+export const kunaRetainedResourceCleanupError = (
+  cause: unknown,
+  operation: string,
+): AnalysisError | undefined => {
+  if (
+    !(cause instanceof ArtifactReaderFailure) ||
+    cause.cleanupLeases === undefined ||
+    cause.cleanupLeases.length === 0
+  )
+    return undefined;
+  const cleanup = new ProviderCleanupError(
+    KUNA_PROVIDER_ID,
+    cause.cleanup?.resources ?? [],
+    { reason: message(cause) },
+    { cause, operation },
+  );
+  bindArtifactFileCleanup(cause, cleanup);
+  return cleanup;
 };
 
 /** File metadata that, unchanged, lets a verified digest stand without re-hashing. */

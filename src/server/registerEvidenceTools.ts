@@ -107,7 +107,9 @@ export const registerEvidenceTools = (
               options.sourceEvidence?.(contract.name, execution.value.result) ??
               [];
             const evidence = createEvidence(
-              execution.value.subject ?? options.activeTarget?.(),
+              execution.value.subject === undefined
+                ? options.activeTarget?.()
+                : (execution.value.subject ?? undefined),
               execution.value.provider,
               {
                 operation: contract.name,
@@ -120,6 +122,12 @@ export const registerEvidenceTools = (
                   : { analysisProfile: execution.value.analysisProfile }),
                 rawResult: execution.value.rawResult,
                 limitations: execution.value.limitations,
+                ...(execution.value.relationshipCoverage === undefined
+                  ? {}
+                  : {
+                      relationshipCoverage:
+                        execution.value.relationshipCoverage,
+                    }),
                 locations: execution.value.locations,
                 evidenceLinks: sourceEvidence.map(({ evidence_id: id }) => id),
               },

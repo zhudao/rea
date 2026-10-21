@@ -1,3 +1,4 @@
+import type { AnalysisViewRequest } from "../domain/analysisView/analysisView.js";
 import { z } from "incur";
 import { parseEvidence, type Evidence } from "../domain/evidence.js";
 import type { JsonValue } from "../domain/jsonValue.js";
@@ -34,11 +35,14 @@ const isEvidence = (value: JsonValue): value is Evidence =>
   "normalized_result" in value;
 
 interface CliEvidenceDelivery {
+  readonly view?: AnalysisViewRequest;
   readonly providerId: string;
   readonly operation: string;
   readonly signal: AbortSignal;
   readonly detail: "complete" | "summary";
   readonly evidenceOutput: string | undefined;
+  /** Derived workflows publish their selected source closure with the result. */
+  readonly sourceEvidence?: readonly Evidence[];
 }
 
 export const cliEvidenceDeliveryInputError = (
@@ -93,6 +97,7 @@ export const deliverCliAnalysisEvidence = async (
     signal,
     detail,
     evidenceOutput,
+    ...(input.view === undefined ? {} : { view: input.view }),
   });
 };
 
@@ -115,7 +120,14 @@ export const publishCliAnalysisEvidence = async (
   const delivered = await finishAnalysisCommand(
     async () => {
       const written = await writeEvidenceBundle(
-        createEvidenceBundle([complete]),
+        createEvidenceBundle([
+          ...new Map(
+            [...(input.sourceEvidence ?? []), complete].map((record) => [
+              record.evidence_id,
+              record,
+            ]),
+          ).values(),
+        ]),
         absoluteCallerPath(evidenceOutput),
         false,
         resources,
@@ -130,7 +142,7 @@ export const publishCliAnalysisEvidence = async (
       return detail === "summary"
         ? inspectAnalysisView({
             source: { kind: "inline", evidence: complete },
-            view: { kind: "summary" },
+            view: input.view ?? { kind: "summary" },
           })
         : { ok: true as const, value: complete };
     },

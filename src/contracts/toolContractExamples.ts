@@ -53,6 +53,7 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   trace_call_path: { start: "0x1000", goal: "0x1100" },
   trace_native_ui_action: { action: "buildTapped:" },
   open_binary: { path: "/tmp/fixture" },
+  open_bundle_resources: { path: "/tmp/Fixture.app" },
   export_evidence_bundle: { path: "/tmp/evidence.json" },
   get_evidence_bundle: {
     detail: "summary",
@@ -73,6 +74,10 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   compare_artifacts: {
     left: ARTIFACT_COMPARISON_EXAMPLE.left,
     right: ARTIFACT_COMPARISON_EXAMPLE.right,
+  },
+  match_native_functions: {
+    left: { kind: "retained-evidence", evidence_id: `ev_${"1".repeat(64)}` },
+    right: { kind: "retained-evidence", evidence_id: `ev_${"2".repeat(64)}` },
   },
   compare_functions: {
     left: FUNCTION_COMPARISON_EXAMPLE.left,

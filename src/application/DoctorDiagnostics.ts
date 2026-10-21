@@ -2,6 +2,7 @@ import {
   SUPPORTED_NODE_VERSION_PROSE,
   supportsNodeVersion,
 } from "../domain/runtimeVersion.js";
+import { providerStartupTimeoutSchema } from "../config/providerStartupTimeout.js";
 import {
   linuxHopperLauncherCandidates,
   systemLinuxHopperLauncherCandidates,
@@ -34,6 +35,9 @@ export const collectDoctorDiagnostics = async (
 
   const hopperPath = await findHopper(host);
   checks.push(hopperCheck(host, hopperPath));
+  const hopperTimeoutCheck = optionalHopperStartupTimeoutCheck(host);
+  if (hopperTimeoutCheck !== undefined) checks.push(hopperTimeoutCheck);
+  checks.push(...runtimeConfigurationChecks(host));
   const hopperVersionCheck = await optionalHopperVersionCheck(host, hopperPath);
   if (hopperVersionCheck !== undefined) checks.push(hopperVersionCheck);
 
@@ -80,6 +84,8 @@ export const doctorHealthy = (
     .every(({ ok }) => ok);
   const configuredProvidersHealthy = providerChecks
     .filter(({ name }) => {
+      // Validate the supplied setting independently of provider discovery.
+      if (name === "hopper-startup-timeout") return true;
       if (name.startsWith("hopper")) return providers.hopperConfigured;
       return providers.providerInspections?.some(
         (inspection) =>
@@ -203,6 +209,65 @@ const hopperCheck = (
           : "config_drift",
     },
   );
+
+const optionalHopperStartupTimeoutCheck = (
+  host: DoctorHost,
+): DoctorCheck | undefined => {
+  if (host.configuredHopperStartupTimeout === undefined) return undefined;
+  const parsed = providerStartupTimeoutSchema.safeParse(
+    host.configuredHopperStartupTimeout,
+  );
+  return check(
+    "hopper-startup-timeout",
+    parsed.success,
+    parsed.success
+      ? `REA_HOPPER_STARTUP_TIMEOUT_MS=${String(parsed.data)}`
+      : `REA_HOPPER_STARTUP_TIMEOUT_MS: ${parsed.error.issues.map(({ message }) => message).join("; ")}`,
+    {
+      classification: "config_drift",
+      remediation:
+        "Unset REA_HOPPER_STARTUP_TIMEOUT_MS to use the default, or set it to a positive decimal integer from 1 to 2147483647 milliseconds.",
+    },
+  );
+};
+
+/**
+ * Project every native-analysis admission failure except the Hopper timeout,
+ * which already has its own check. Provider scopes include engine settings.
+ * Settings that block process start are marked for every doctor scope.
+ */
+const runtimeConfigurationChecks = (
+  host: DoctorHost,
+): readonly DoctorCheck[] => {
+  const issues = host.configurationIssues;
+  if (issues === undefined || issues.length === 0) return [];
+  const grouped: { setting: string; constraints: string[] }[] = [];
+  for (const issue of issues) {
+    if (issue.setting === "REA_HOPPER_STARTUP_TIMEOUT_MS") continue;
+    const existing = grouped.find((item) => item.setting === issue.setting);
+    if (existing === undefined)
+      grouped.push({ setting: issue.setting, constraints: [issue.constraint] });
+    else existing.constraints.push(issue.constraint);
+  }
+  return grouped.map(({ setting, constraints }) => ({
+    ...check(
+      `runtime-configuration:${setting}`,
+      false,
+      constraints
+        .map((constraint) =>
+          constraint.includes(setting)
+            ? constraint.replace(/\.$/u, "")
+            : `${setting}: ${constraint}`,
+        )
+        .join("; "),
+      {
+        classification: "config_drift",
+        remediation: `Correct ${setting} in the environment that starts REA (your shell or the MCP client's registration), then rerun.`,
+      },
+    ),
+    details: { setting },
+  }));
+};
 
 const optionalHopperVersionCheck = async (
   host: DoctorHost,

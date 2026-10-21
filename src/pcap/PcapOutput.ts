@@ -1,9 +1,11 @@
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
+  AnalysisCancelledError,
   AnalysisProtocolError,
   AnalysisResourceConstraintError,
 } from "../domain/analysisErrorCore.js";
 import { parseRecordedTransportUrl } from "../domain/recordedTransportUrl.js";
+import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 const OPERATION = "inspect_pcap_capture";
@@ -11,6 +13,11 @@ const OPERATION = "inspect_pcap_capture";
 export const TSHARK_JSON_MAX_BYTES = 8 * 1024 * 1024;
 const MAX_RETAINED_BYTES = 16 * 1024 * 1024;
 const MAX_DECODED_BYTES = 128 * 1024 * 1024;
+
+const assertOutputReadActive = (signal: AbortSignal | undefined): void => {
+  if (signal?.aborted)
+    throw new AnalysisCancelledError(OPERATION, { cause: signal.reason });
+};
 
 const protocolFailure = (reason: string): never => {
   throw new AnalysisProtocolError(`Invalid packet-capture output: ${reason}`);
@@ -148,13 +155,14 @@ export const parseTsharkJsonOutput = async (
   stdout: string,
   signal?: AbortSignal,
 ): Promise<TsharkFields> => {
-  signal?.throwIfAborted();
+  assertOutputReadActive(signal);
   if (Buffer.byteLength(stdout) > TSHARK_JSON_MAX_BYTES)
     throw new AnalysisResourceConstraintError(
       OPERATION,
       "memory",
       "tshark JSON exceeds the bounded decoding budget",
       { max_json_bytes: TSHARK_JSON_MAX_BYTES },
+      fixedAllowanceOptions("The tshark JSON decoding allowance", "capture"),
     );
   // The selected-field protocol has five container levels. Reject deeper
   // graphs before materializing them; quoted brackets are string data.
@@ -165,7 +173,7 @@ export const parseTsharkJsonOutput = async (
   for (let index = 0; index < stdout.length; index += 1) {
     if (index % 65536 === 0) {
       await yieldToEventLoop();
-      signal?.throwIfAborted();
+      assertOutputReadActive(signal);
     }
     const char = stdout[index];
     if (quoted) {
@@ -186,6 +194,7 @@ export const parseTsharkJsonOutput = async (
         "memory",
         "tshark JSON expansion exceeds the decoding budget",
         { max_decoded_bytes: MAX_DECODED_BYTES },
+        fixedAllowanceOptions("The tshark JSON expansion allowance", "capture"),
       );
   }
   let packets: unknown;
@@ -214,6 +223,10 @@ export const parseTsharkJsonOutput = async (
         "memory",
         "Packet inventory exceeds the retained-fact budget",
         { max_retained_bytes: MAX_RETAINED_BYTES },
+        fixedAllowanceOptions(
+          "The packet-inventory retained-fact allowance",
+          "capture",
+        ),
       );
   };
   const add = (set: Set<string>, value: string): void => {
@@ -225,7 +238,7 @@ export const parseTsharkJsonOutput = async (
   for (let index = 0; index < packets.length; index += 1) {
     if (index % 256 === 0) {
       await yieldToEventLoop();
-      signal?.throwIfAborted();
+      assertOutputReadActive(signal);
     }
     const packet: unknown = packets[index];
     if (
@@ -320,7 +333,7 @@ export const parseTsharkJsonOutput = async (
       );
     }
   }
-  signal?.throwIfAborted();
+  assertOutputReadActive(signal);
   return {
     endpoints: [...endpoints]
       .sort((a, b) => b[1] - a[1] || compareUnicodeCodePoints(a[0], b[0]))

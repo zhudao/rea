@@ -37,7 +37,9 @@ export interface EnhancedToolRegistration {
   readonly logger: Logger;
   readonly activeTarget: (() => BinaryTarget | undefined) | undefined;
   readonly analysisProfile:
-    | (() => AnalysisProfileCommitment | undefined)
+    | ((
+        operation: ValidatedEnhancedCall["name"],
+      ) => AnalysisProfileCommitment | undefined)
     | undefined;
   readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
   readonly recordUnknown: UnknownRegistryPort["recordUnknown"] | undefined;
@@ -260,7 +262,7 @@ const executeEnhancedTool = async (
           operation: name,
           parameters,
           result: result.value.result,
-          upstreamProfile: registration.analysisProfile?.(),
+          upstreamProfile: registration.analysisProfile?.(name),
           upstreamLimitations: result.value.limitations,
         });
         const recorded = registration.recordEvidence?.(evidence);
@@ -270,7 +272,12 @@ const executeEnhancedTool = async (
           name !== "trace_native_ui_action" &&
           registration.allowsSnapshotReplay?.(name) === true
         ) {
-          const workflowRecord = workflowSnapshotRecord(evidence, name);
+          const workflowRecord = workflowSnapshotRecord(
+            evidence,
+            name,
+            registration.analysisProfile?.(name),
+            result.value.cachePolicy,
+          );
           if (workflowRecord !== undefined) {
             const snapshot =
               registration.recordWorkflowSnapshot?.(workflowRecord);

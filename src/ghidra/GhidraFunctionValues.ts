@@ -1,3 +1,4 @@
+import { procedureInfoSchema } from "../domain/native/procedureInfo.js";
 import { z } from "zod";
 import {
   nativeFunctionAnnotationsInputSchema,
@@ -181,13 +182,11 @@ const procedureReferences = z
     ),
   })
   .strict();
-const procedureInfo = z
-  .object({
+const procedureInfo = procedureInfoSchema
+  .safeExtend({
     name: z.string().min(1),
     entrypoint: ghidraCanonicalAddressSchema,
-    basicblock_count: z.number().int().min(0),
     length: z.number().int().min(0),
-    signature: z.string().nullable(),
     locals: z.array(localVariable),
     classification,
     body: ghidraFunctionBody,
@@ -425,6 +424,7 @@ const functionBoundaryObservationOperations: ReadonlySet<GhidraFunctionOperation
 const functionObservationEnvelope = z.strictObject({
   value: z.unknown(),
   limitations: z.array(z.string()),
+  cache_policy: z.literal("live").exactOptional(),
   relationship_coverage: relationshipCoverageSchema.exactOptional(),
   selection: z
     .strictObject({
@@ -437,6 +437,8 @@ const functionObservationEnvelope = z.strictObject({
 
 export interface ParsedGhidraFunctionResult {
   readonly value: JsonValue;
+  readonly rawResult?: JsonValue;
+  readonly cachePolicy?: "live";
   readonly limitations: readonly string[];
   readonly locations?: readonly EvidenceLocation[];
   readonly relationshipCoverage?: RelationshipCoverage;
@@ -450,6 +452,7 @@ export const parseGhidraFunctionResult = (
   let observation: {
     readonly value: unknown;
     readonly limitations: readonly string[];
+    readonly cache_policy?: "live";
     readonly relationship_coverage?: RelationshipCoverage;
     readonly selection?: z.infer<
       typeof functionObservationEnvelope
@@ -459,6 +462,8 @@ export const parseGhidraFunctionResult = (
     const envelope = functionObservationEnvelope.safeParse(value);
     if (
       !envelope.success ||
+      (operation !== "analyze_function" &&
+        envelope.data.cache_policy !== undefined) ||
       (operation !== "analyze_function" &&
         operation !== "procedure_callers" &&
         operation !== "procedure_callees" &&
@@ -482,12 +487,17 @@ export const parseGhidraFunctionResult = (
     ? ok({
         value: jsonValueSchema.parse(parsed.data),
         limitations: observation.limitations,
+        ...(observation.cache_policy === undefined
+          ? {}
+          : { cachePolicy: observation.cache_policy }),
         ...(observation.relationship_coverage === undefined
           ? {}
           : { relationshipCoverage: observation.relationship_coverage }),
         ...(observation.selection === undefined
           ? {}
           : {
+              // Generic locations retain coordinates but not their mapping roles.
+              rawResult: value,
               locations: [
                 {
                   kind: "file-offset" as const,

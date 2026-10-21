@@ -60,6 +60,7 @@ import {
   projectSemanticFrontiers,
   projectSemanticPromises,
   projectSemanticReturnValues,
+  semanticObjectReadOccurrence,
   type SemanticFlowProjectionContext,
 } from "./JavaScriptSemanticGraphFlowProjection.js";
 import {
@@ -660,10 +661,10 @@ function* projectFileSteps(
 const projectFileResourceLimits = (
   context: Pick<FileContext, "file" | "ir" | "state" | "moduleNode">,
 ): void => {
-  // Getter limits describe query effects without tagged values; other limits
+  // Query limits describe effects without tagged values; other limits
   // already project from binding or return-site values and must not be duplicated.
   for (const limit of semanticCoverageResourceLimits(context.ir.coverage)) {
-    if (limit !== "getter-expansion") continue;
+    if (limit !== "getter-expansion" && limit !== "alias-selections") continue;
     addSemanticGraphUnknown(context.state, {
       node_id: context.moduleNode.node_id,
       family: "data-flow",
@@ -828,6 +829,15 @@ const projectCalls = (context: FileContext): void => {
               ? "resolved"
               : "candidate",
         });
+      addRelation(context.state, {
+        source: semanticObjectReadOccurrence(
+          context,
+          argument.valueExpressionLocation,
+        ),
+        target: argumentNode,
+        relation: "aliases",
+        resolution: "resolved",
+      });
     }
   }
   for (const flow of context.ir.argumentFlows) {

@@ -82,6 +82,7 @@ export const analysisErrorRemediationAction = (
     error.remediationAction !== undefined
   )
     return error.remediationAction;
+  if (error instanceof AnalysisTimeoutError) return timeoutRemediation(error);
   if (error instanceof HopperTimeoutError)
     return error.operation === undefined
       ? "Review details.launcher and inspect Hopper for ongoing initial analysis or a pending loader, demo, or license dialog. For a large target, increase REA_HOPPER_STARTUP_TIMEOUT_MS in the environment that starts REA and allow at least that long in the MCP client. Resolve retained cleanup before reopening."
@@ -130,7 +131,7 @@ export const analysisErrorRemediationAction = (
   if (error instanceof ConfigurationError && error.settings.length > 0)
     return `Correct ${[...new Set(error.settings.map(({ setting }) => setting))].join(", ")} in the environment that starts REA (your shell or the MCP client's registration), then rerun.`;
   if (error instanceof AnalysisInputError)
-    return "Correct the listed arguments and retry.";
+    return `Read the declared input schema or CLI usage for ${error.operation}; if using MCP and the catalog may be stale, call tools/list. Correct the listed fields, then retry. Do not repeat the unchanged call.`;
   if (
     error instanceof AnalysisOutputError &&
     error.remediationAction !== undefined
@@ -254,6 +255,8 @@ export const analysisErrorUserMessage = (error: AnalysisError): string => {
       error.userMessage ??
       "Analysis input is invalid. Check the arguments and try again."
     );
+  if (error instanceof AnalysisTimeoutError)
+    return error.userMessage ?? timeoutUserMessage(error);
   const hopperMessage = hopperErrorUserMessage(error);
   if (hopperMessage !== undefined) return hopperMessage;
   if (error.userMessage !== undefined) return error.userMessage;
@@ -382,6 +385,12 @@ const standardErrorMessage = (tag: AnalysisErrorTag): string | undefined => {
     return "Analysis could not start or stopped unexpectedly. Run `rea doctor`, then try again.";
   return undefined;
 };
+
+const timeoutUserMessage = (error: AnalysisTimeoutError): string =>
+  `REA's ${error.operation} operation reached its ${String(error.timeoutMs)}ms server/provider deadline. This is not a client-side timeout; extending only the MCP client's deadline does not change this budget.`;
+
+const timeoutRemediation = (error: AnalysisTimeoutError): string =>
+  `Inspect any partial Evidence, provider diagnostics and reported session/provider cleanup state for ${error.operation}. Reduce the request if supported, or resolve the reported provider condition before retrying. Do not repeat the unchanged call or retry while work or cleanup may still be active.`;
 
 const UNREADABLE_OUTPUT_TAGS: ReadonlySet<AnalysisErrorTag> = new Set([
   "AnalysisProtocolError",

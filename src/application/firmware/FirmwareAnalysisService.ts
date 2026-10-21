@@ -12,6 +12,7 @@ import {
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import { jsonObjectSchema } from "../../domain/jsonValue.js";
+import { projectInputIssues } from "../../domain/inputIssueProjection.js";
 import { err, type Result } from "../../domain/result.js";
 import { completeProviderEvidence } from "../ProviderOperationExecution.js";
 
@@ -30,14 +31,22 @@ export class FirmwareAnalysisService {
     options?: ExecutionOptions,
   ): Promise<Result<Evidence, AnalysisError>> {
     if (options?.signal?.aborted === true)
-      return err(new AnalysisCancelledError(operation));
+      return err(
+        new AnalysisCancelledError(operation, { cause: options.signal.reason }),
+      );
     const parsed = firmwareRequestSchema.safeParse({ operation, input });
     if (!parsed.success)
-      return err(new AnalysisInputError(operation, { cause: parsed.error }));
+      return err(
+        new AnalysisInputError(
+          operation,
+          { cause: parsed.error },
+          projectInputIssues(parsed.error.issues, { operation, input }),
+        ),
+      );
     const executed = await this.provider.execute(parsed.data, options);
     if (!executed.ok) return executed;
     const execution = executed.value;
-    if (execution.subject === null)
+    if (execution.subject == null)
       return err(
         new AnalysisOutputError(
           operation,

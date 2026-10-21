@@ -4,6 +4,11 @@ import { stat as statPath } from "node:fs/promises";
 import type { Stats } from "node:fs";
 
 import {
+  requireAnalysisViewRetention,
+  summarizeRetainedAnalysis,
+  type AnalysisViewRetention,
+} from "../analysisView/AnalysisViewService.js";
+import {
   AnalysisAccessDeniedError,
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
@@ -11,11 +16,12 @@ import {
   AnalysisResourceConstraintError,
   AnalysisTimeoutError,
 } from "../../domain/analysisErrorCore.js";
-import type {
-  AnalysisCleanupObservation,
+import {
   AnalysisError,
+  type AnalysisCleanupObservation,
 } from "../../domain/analysisErrorBase.js";
 import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
+import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -179,29 +185,41 @@ export class ReverseEngineeringService {
     if (!cleanup.ok) throw cleanup.error;
   }
 
-  inspectWithObjdump(
+  async inspectWithObjdump(
     rawInput: unknown,
     options: { readonly signal?: AbortSignal } = {},
+    retention: AnalysisViewRetention = {
+      evidenceById: undefined,
+      recordEvidence: undefined,
+    },
   ): Promise<Result<Evidence, AnalysisError>> {
     const parsed = objdumpInputSchema.safeParse(rawInput);
     if (!parsed.success)
-      return Promise.resolve(
-        err(new AnalysisInputError("inspect_with_objdump")),
+      return err(new AnalysisInputError("inspect_with_objdump"));
+    const { detail, ...input } = parsed.data;
+    if (detail === "summary") {
+      const ready = requireAnalysisViewRetention(
+        "inspect_with_objdump",
+        retention,
       );
-    const input = parsed.data;
+      if (!ready.ok) return ready;
+    }
     const command = this.#commands.objdump(input);
     let parameters: Readonly<Record<string, JsonValue>>;
     if (input.operation === "disassemble") {
       const { symbol, ...base } = input;
       parameters = symbol === undefined ? base : { ...base, symbol };
     } else parameters = input;
-    return this.#observe(
+    const observed = await this.#observe(
       "inspect_with_objdump",
       command,
       input.operation === "architectures" ? undefined : input.path,
       parameters,
       options.signal,
     );
+    return observed.ok && detail === "summary"
+      ? summarizeRetainedAnalysis(observed.value, retention)
+      : observed;
   }
 
   executeRizinCommand(
@@ -232,7 +250,9 @@ export class ReverseEngineeringService {
     signal?: AbortSignal,
   ): Promise<Result<Evidence, AnalysisError>> {
     if (signal?.aborted)
-      return Promise.resolve(err(new AnalysisCancelledError(operation)));
+      return Promise.resolve(
+        err(new AnalysisCancelledError(operation, { cause: signal.reason })),
+      );
     if (this.#closing)
       return Promise.resolve(
         err(
@@ -293,7 +313,10 @@ export class ReverseEngineeringService {
     signal?: AbortSignal,
   ): Promise<Result<Evidence, AnalysisError>> {
     const { executable: command, arguments: args } = profile;
-    if (signal?.aborted) return err(new AnalysisCancelledError(operation));
+    if (signal?.aborted)
+      return err(
+        new AnalysisCancelledError(operation, { cause: signal.reason }),
+      );
     const cleanup = await this.retryCleanup(operation);
     if (!cleanup.ok) return cleanup;
     const absolutePath =
@@ -303,9 +326,13 @@ export class ReverseEngineeringService {
       if (absolutePath !== undefined)
         digest = await this.#digest(absolutePath, signal, this.#stat);
     } catch (cause) {
-      const code = (cause as NodeJS.ErrnoException).code;
-      if (signal?.aborted)
-        return err(new AnalysisCancelledError(operation, { cause }));
+      const code = commandFailureCode(cause);
+      if (preflightCancelled(signal, cause, code))
+        return err(
+          new AnalysisCancelledError(operation, {
+            cause: callerCancellationCause(signal, cause),
+          }),
+        );
       if (code === "EACCES" || code === "EPERM") {
         const deniedPath = absolutePath === undefined ? command : absolutePath;
         return err(
@@ -318,7 +345,48 @@ export class ReverseEngineeringService {
         return err(
           new AnalysisTimeoutError(operation, DEFAULT_TIMEOUT_MS, { cause }),
         );
-      return err(new AnalysisInputError(operation, { cause }));
+      if (
+        code !== "ENOENT" &&
+        code !== "ENOTDIR" &&
+        code !== "EINVAL" &&
+        code !== "ELOOP" &&
+        code !== "ENAMETOOLONG"
+      ) {
+        if (cause instanceof AnalysisError) return err(cause);
+        return err(
+          new ProviderAdapterError(profile.identity.id, operation, {
+            cause,
+            diagnostics: {
+              phase: "target_preflight",
+              ...(code === undefined ? {} : { system_code: code }),
+            },
+          }),
+        );
+      }
+      const targetReason =
+        code === "EINVAL"
+          ? "The selected target is not a regular file."
+          : code === "ELOOP"
+            ? "The selected target path contains a symbolic-link loop."
+            : code === "ENAMETOOLONG"
+              ? "The selected target path is too long."
+              : "The selected target was not found.";
+      return err(
+        new AnalysisInputError(
+          operation,
+          {
+            cause,
+            userMessage: `${targetReason} Selected path: ${absolutePath}. Check the path and choose a readable regular file before retrying.`,
+          },
+          [
+            {
+              path: ["path"],
+              reason: "invalid_value",
+              message: `${targetReason}${code === undefined ? "" : ` (host error ${code})`}`,
+            },
+          ],
+        ),
+      );
     }
     let stdout = "";
     let stderr = "";
@@ -384,8 +452,7 @@ export class ReverseEngineeringService {
           },
         );
       const capture = execFileOutputFailure(cause);
-      const code =
-        capture?.code ?? (cause as NodeJS.ErrnoException).code ?? undefined;
+      const code = capture?.code ?? commandFailureCode(cause);
       if (earlyFailure === undefined && code === "E2BIG")
         earlyFailure = new AnalysisResourceConstraintError(
           operation,
@@ -406,9 +473,9 @@ export class ReverseEngineeringService {
           code === "ENOENT" ||
           code === "ERR_PROVIDER_LAUNCH")
       ) {
-        if (signal?.aborted || code === "ABORT_ERR")
+        if (commandCancelled(signal, cause, code))
           earlyFailure = new AnalysisCancelledError(operation, {
-            cause,
+            cause: callerCancellationCause(signal, cause),
             ...ownedCleanupOptions(cause),
           });
         else if (code === "ETIMEDOUT")
@@ -462,9 +529,9 @@ export class ReverseEngineeringService {
               : null,
           signal: capture.signal,
         };
-        if (signal?.aborted || code === "ABORT_ERR")
+        if (commandCancelled(signal, cause, code))
           failure = new AnalysisCancelledError(operation, {
-            cause,
+            cause: callerCancellationCause(signal, cause),
             capturedOutput,
             ...ownedCleanupOptions(cause),
           });
@@ -547,6 +614,7 @@ export class ReverseEngineeringService {
     }
     if (signal?.aborted && failure === undefined) {
       failure = new AnalysisCancelledError(operation, {
+        cause: signal.reason,
         capturedOutput: {
           stdout,
           stderr,
@@ -592,6 +660,7 @@ export class ReverseEngineeringService {
           ]
         : []),
       ...(operation === "inspect_with_objdump" &&
+      parameters.operation === "dwarf" &&
       parameters.follow_debug_links === true
         ? [
             "DWARF output may include local debug-link files whose identities are not bound to Evidence.",
@@ -913,6 +982,56 @@ const digestFile = async (
   });
 };
 
+const PHYSICAL_FAILURE_CODES = new Set([
+  "EACCES",
+  "EPERM",
+  "ETIMEDOUT",
+  "ENOENT",
+  "ENOTDIR",
+  "EINVAL",
+  "ELOOP",
+  "ENAMETOOLONG",
+  "E2BIG",
+  "EBUSY",
+  "ERR_PROVIDER_LAUNCH",
+]);
+
+/**
+ * A late abort does not replace a recognized physical failure. Other rejections
+ * observed while the caller signal is aborted remain cancellation. A bare
+ * `ABORT_ERR` is not cancellation until the command boundary, which already
+ * used that code for an aborted provider process.
+ */
+const preflightCancelled = (
+  signal: AbortSignal | undefined,
+  cause: unknown,
+  code: string | number | undefined,
+): boolean => {
+  if (cause instanceof AnalysisCancelledError) return true;
+  if (signal?.aborted !== true) return false;
+  if (cause === signal.reason) return true;
+  return typeof code !== "string" || !PHYSICAL_FAILURE_CODES.has(code);
+};
+
+const commandCancelled = (
+  signal: AbortSignal | undefined,
+  cause: unknown,
+  code: string | number | undefined,
+): boolean => code === "ABORT_ERR" || preflightCancelled(signal, cause, code);
+
+const callerCancellationCause = (
+  signal: AbortSignal | undefined,
+  cause: unknown,
+): unknown => (signal?.aborted === true ? signal.reason : cause);
+
+const commandFailureCode = (cause: unknown): string | number | undefined => {
+  if (typeof cause !== "object" || cause === null) return undefined;
+  const code: unknown = Reflect.get(cause, "code");
+  return typeof code === "string" || typeof code === "number"
+    ? code
+    : undefined;
+};
+
 const statWithDeadline = (
   path: string,
   signal: AbortSignal | undefined,
@@ -922,22 +1041,24 @@ const statWithDeadline = (
     return Promise.reject(new AnalysisCancelledError("artifact_digest"));
   return new Promise<Stats>((resolveStat, rejectStat) => {
     let settled = false;
-    const finish = (cause?: unknown, value?: Stats): void => {
+    const finish = (outcome: Result<Stats, unknown>): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      if (cause !== undefined) rejectStat(cause);
-      else resolveStat(value!);
+      if (outcome.ok) resolveStat(outcome.value);
+      else rejectStat(outcome.error);
     };
     const abort = (): void =>
-      finish(new AnalysisCancelledError("artifact_digest"));
+      finish(err(new AnalysisCancelledError("artifact_digest")));
     const timer = setTimeout(
       () =>
         finish(
-          Object.assign(new Error("Artifact stat timed out"), {
-            code: "ETIMEDOUT",
-          }),
+          err(
+            Object.assign(new Error("Artifact stat timed out"), {
+              code: "ETIMEDOUT",
+            }),
+          ),
         ),
       DEFAULT_TIMEOUT_MS,
     );
@@ -950,11 +1071,11 @@ const statWithDeadline = (
     // stat rejection is observed and cannot become an unhandled rejection.
     try {
       void stat(path).then(
-        (info) => finish(undefined, info),
-        (cause: unknown) => finish(cause),
+        (info) => finish(ok(info)),
+        (cause: unknown) => finish(err(cause)),
       );
     } catch (cause) {
-      finish(cause);
+      finish(err(cause));
     }
   });
 };

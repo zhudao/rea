@@ -38,14 +38,21 @@ export const executeComposedWorkflow = async (
   ) => Promise<Result<JsonValue, AnalysisError>>,
 ): Promise<
   Result<
-    { readonly result: JsonValue; readonly limitations: readonly string[] },
+    {
+      readonly result: JsonValue;
+      readonly limitations: readonly string[];
+      readonly cachePolicy?: "live";
+    },
     AnalysisError
   >
 > => {
   const limitations = new Map<string, SourceLimitation>();
+  let cachePolicy: "live" | undefined;
   const result = await execute({
     execute: async (operation, parameters, options) => {
       const execution = await analysis.execute(operation, parameters, options);
+      if (execution.ok && execution.value.cachePolicy === "live")
+        cachePolicy = "live";
       if (execution.ok)
         for (const limitation of execution.value.limitations) {
           const fact = {
@@ -62,6 +69,7 @@ export const executeComposedWorkflow = async (
   return ok({
     result: result.value,
     limitations: renderSourceLimitations([...limitations.values()]),
+    ...(cachePolicy === undefined ? {} : { cachePolicy }),
   });
 };
 
@@ -125,10 +133,18 @@ const batchProcedureLocations = (result: JsonValue): EvidenceLocation[] => {
 export const workflowSnapshotRecord = (
   evidence: Evidence,
   operation: AnalysisOperation,
+  bindingProfile: AnalysisProfileCommitment | undefined,
+  cachePolicy?: "live",
 ): WorkflowSnapshotRecordInput | undefined => {
-  if (evidence.analysis_profile === null) return undefined;
+  if (
+    evidence.analysis_profile === null ||
+    bindingProfile === undefined ||
+    cachePolicy === "live"
+  )
+    return undefined;
   return {
     operation,
+    bindingProfile,
     parameters: evidence.parameters,
     execution: {
       result: evidence.normalized_result,
