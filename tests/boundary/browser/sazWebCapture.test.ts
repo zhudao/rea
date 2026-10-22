@@ -289,6 +289,114 @@ it("checks trailer credentials before hidden metadata blocks analysis and withho
   expect(await readFile(path)).toEqual(bytes);
 });
 
+it("keeps automatic framing applicability unknown when SAZ Content-Type is excluded or conflicting", async () => {
+  const body = protobufFrame(Buffer.from([8, 1]));
+  const response = (headers: string) =>
+    Buffer.concat([
+      Buffer.from(
+        `HTTP/1.1 200 OK\r\n${headers}Content-Length: ${body.length}\r\n\r\n`,
+      ),
+      body,
+    ]);
+  const bytes = await archive([
+    ["raw/1_s.txt", response("Content-Type: application/grpc\r\n")],
+    [
+      "raw/2_s.txt",
+      response(
+        "Content-Type: application/grpc\r\nContent-Type: text/plain\r\n",
+      ),
+    ],
+    ["raw/3_s.txt", response("")],
+    ["raw/4_s.txt", response("Content-Type: application/octet-stream\r\n")],
+    [
+      "raw/5_s.txt",
+      response(
+        "Content-Type: application/grpc\r\nContent-Type: Application/GRPC ; x=1\r\n",
+      ),
+    ],
+  ]);
+  const path = await fixture(bytes);
+  const inspect = async (extra: string[]) =>
+    webNetworkCaptureSchema.parse((await cli(path, extra)).normalized_result);
+  const unknown = expect.stringMatching(
+    /^Selected body's MIME metadata is excluded, conflicting or unavailable/,
+  );
+  const retainedBody = expect.objectContaining({
+    pointer: "/response/body",
+    state: "retained",
+    sha256: createHash("sha256").update(body).digest("hex"),
+  });
+
+  // Repeated declarations with one media-type essence agree; distinct essences conflict.
+  const visible = await inspect([
+    "--record",
+    "0",
+    "--record",
+    "1",
+    "--record",
+    "4",
+  ]);
+  const record = (ordinal: number) =>
+    visible.records.find((item) => item.ordinal === ordinal);
+  for (const ordinal of [0, 4]) {
+    expect(record(ordinal)?.protobuf).toMatchObject([
+      { status: "complete", fields: [{ number: 1, value: "1" }] },
+    ]);
+    expect(record(ordinal)?.limitations).toEqual([]);
+  }
+  // The first raw declaration, including its SAZ leading space, remains the reported value.
+  expect(record(4)?.protobuf?.[0]?.content_type).toBe(" application/grpc");
+  expect(record(1)?.protobuf).toBeUndefined();
+  expect(record(1)?.limitations).toEqual([unknown]);
+  expect(visible.protobuf_coverage).toEqual({
+    status: "partial",
+    selected_records: 3,
+    inspected_records: 3,
+  });
+
+  const known = await inspect(["--record", "2", "--record", "3"]);
+  expect(known.protobuf_coverage?.status).toBe("complete");
+  for (const record of known.records) {
+    expect(record.protobuf).toBeUndefined();
+    expect(record.limitations).toEqual([]);
+  }
+
+  for (const sensitive of ["application/grpc", "Content-Type"]) {
+    const excluded = await inspect([
+      "--record",
+      "0",
+      "--sensitive-value",
+      sensitive,
+    ]);
+    expect(excluded.protobuf_coverage, sensitive).toEqual({
+      status: "partial",
+      selected_records: 1,
+      inspected_records: 1,
+    });
+    expect(excluded.records[0]?.protobuf).toBeUndefined();
+    expect(excluded.records[0]?.limitations).toEqual([unknown]);
+    expect(excluded.records[0]?.binary_fields).toContainEqual(retainedBody);
+    expect(excluded.records[0]?.redactions).toContainEqual({
+      pointer: `/response/headers/0/${sensitive === "Content-Type" ? "name" : "value"}`,
+      reason: "explicit-sensitive-value",
+    });
+  }
+
+  const explicit = await inspect([
+    "--record",
+    "0",
+    "--sensitive-value",
+    "application/grpc",
+    "--protobuf-framing",
+    "grpc",
+  ]);
+  expect(explicit.protobuf_coverage?.status).toBe("complete");
+  expect(explicit.records[0]?.protobuf).toMatchObject([
+    { status: "complete", fields: [{ number: 1, value: "1" }] },
+  ]);
+  expect(await readFile(path)).toEqual(bytes);
+});
+
 it("inspects native SAZ through the public CLI and MCP with equal evidence, bytes and archive coordinates", async () => {
   const bytes = await archive();
   const path = await fixture(bytes);
@@ -517,6 +625,46 @@ it("keeps CRLF separators inside a body after LF-only HTTP headers", async () =>
       sha256: createHash("sha256").update(body).digest("hex"),
     });
   expect(await readFile(path)).toEqual(bytes);
+});
+
+it("reports zero-byte SAZ HTTP members as null instead of rejecting the archive", async () => {
+  const bytes = await archive([
+    ["raw/1_c.txt", Buffer.from("GET https://example.test/ HTTP/1.1\r\n\r\n")],
+    ["raw/1_s.txt", Buffer.alloc(0)],
+    ["raw/2_c.txt", Buffer.alloc(0)],
+    ["raw/2_s.txt", Buffer.from("HTTP/1.1 204 No Content\r\n\r\n")],
+    ["raw/2_w.txt", Buffer.alloc(0)],
+  ]);
+  const path = await fixture(bytes);
+  const capture = webNetworkCaptureSchema.parse(
+    (await cli(path)).normalized_result,
+  );
+  expect(capture.total_records).toBe(2);
+  expect(capture.records[0]?.reported).toMatchObject({
+    request: { method: "GET" },
+    response: null,
+  });
+  expect(capture.records[1]?.reported).toMatchObject({
+    request: null,
+    response: { status: "204" },
+    websocket: { member: "raw/2_w.txt" },
+  });
+  expect(capture.records[0]?.location).toEqual({
+    kind: "archive-members",
+    members: ["raw/1_c.txt", "raw/1_s.txt"],
+  });
+  expect(capture.records[0]?.limitations).toEqual([
+    "The stored response member is empty (zero bytes); the response is reported as null.",
+  ]);
+  expect(capture.records[1]?.limitations).toEqual([
+    "The stored request member is empty (zero bytes); the request is reported as null.",
+  ]);
+  const selected = webNetworkCaptureSchema.parse(
+    (await cli(path, ["--record", "0"])).normalized_result,
+  );
+  expect(selected.records).toMatchObject([
+    { ordinal: 0, reported: { response: null } },
+  ]);
 });
 
 it("validates SAZ XML declarations against archive member bytes at the CLI boundary", async () => {

@@ -2,13 +2,17 @@ import type {
   AdbWindowFocusContext,
   AdbWindowFocusObservation,
 } from "../domain/adb/adbDeviceAnalysis.js";
+import {
+  collectUnparsedLines,
+  type AdbUnparsedLines,
+} from "./AdbUnparsedLines.js";
 
 /**
  * Parsers for fixed observation commands REA runs through `adb shell`.
  *
  * Formats follow toybox output on Android 8+ (verified against an Android 14
- * emulator). Unparseable lines are retained rather than dropped so callers
- * can see the format drift instead of silently losing rows.
+ * emulator). Unparseable lines are sampled and counted rather than dropped so
+ * callers can see the format drift instead of silently losing rows.
  */
 
 export interface AdbProcessEntry {
@@ -29,10 +33,10 @@ export const parseProcessListOutput = (
 ): {
   columns: string | null;
   processes: readonly AdbProcessEntry[];
-  unparsedLines: readonly string[];
+  unparsedLines: AdbUnparsedLines;
 } => {
   const processes: AdbProcessEntry[] = [];
-  const unparsedLines: string[] = [];
+  const unparsed = collectUnparsedLines();
   let columns: string | null = null;
   for (const rawLine of stdout.split(/\r?\n/u)) {
     const line = rawLine.trimEnd();
@@ -43,7 +47,7 @@ export const parseProcessListOutput = (
     }
     const match = PROCESS_LINE.exec(line);
     if (match === null) {
-      unparsedLines.push(line);
+      unparsed.add(line);
       continue;
     }
     processes.push({
@@ -55,7 +59,7 @@ export const parseProcessListOutput = (
       name: match[9]!.trim(),
     });
   }
-  return { columns, processes, unparsedLines };
+  return { columns, processes, unparsedLines: unparsed.facts() };
 };
 
 export interface AdbFeatureEntry {
@@ -73,16 +77,16 @@ export const parseFeatureListOutput = (
   stdout: string,
 ): {
   features: readonly AdbFeatureEntry[];
-  unparsedLines: readonly string[];
+  unparsedLines: AdbUnparsedLines;
 } => {
   const features: AdbFeatureEntry[] = [];
-  const unparsedLines: string[] = [];
+  const unparsed = collectUnparsedLines();
   for (const rawLine of stdout.split(/\r?\n/u)) {
     const line = rawLine.trim();
     if (line === "") continue;
     const match = FEATURE_LINE.exec(line);
     if (match === null) {
-      unparsedLines.push(line);
+      unparsed.add(line);
       continue;
     }
     features.push({
@@ -90,7 +94,7 @@ export const parseFeatureListOutput = (
       version: match[2] === undefined ? null : parseFeatureVersion(match[2]!),
     });
   }
-  return { features, unparsedLines };
+  return { features, unparsedLines: unparsed.facts() };
 };
 
 export interface AdbServiceEntry {
@@ -105,17 +109,17 @@ export const parseServiceListOutput = (
   stdout: string,
 ): {
   services: readonly AdbServiceEntry[];
-  unparsedLines: readonly string[];
+  unparsedLines: AdbUnparsedLines;
 } => {
   const services: AdbServiceEntry[] = [];
-  const unparsedLines: string[] = [];
+  const unparsed = collectUnparsedLines();
   for (const rawLine of stdout.split(/\r?\n/u)) {
     const line = rawLine.trimEnd();
     if (line.trim() === "" || /^Found \d+ services:/u.test(line.trim()))
       continue;
     const match = SERVICE_LINE.exec(line);
     if (match === null) {
-      if (line.trim() !== "") unparsedLines.push(line.trim());
+      if (line.trim() !== "") unparsed.add(line.trim());
       continue;
     }
     services.push({
@@ -123,7 +127,7 @@ export const parseServiceListOutput = (
       interface: match[2] === "" ? null : match[2]!,
     });
   }
-  return { services, unparsedLines };
+  return { services, unparsedLines: unparsed.facts() };
 };
 
 const SIZE_PAIR = /^Physical size:\s+(\d+)x(\d+)$/u;
@@ -272,6 +276,17 @@ export interface AdbPackageDetails {
 const DETAIL_LINE = /^\s+([A-Za-z][A-Za-z0-9_]*)=(.*)$/u;
 
 /**
+ * Package Manager prints its `String` fields by concatenation, so an absent
+ * `installerPackageName` appears as the literal text `null`
+ * (morluto/rea#3943). No installer can be named "null", so an empty value or
+ * that sentinel is the absence of the fact and becomes the nullable result's
+ * null. `versionName` keeps the printed text: a manifest may declare the
+ * string "null" on purpose, and the parser cannot tell the two apart.
+ */
+const absentInstallerOrName = (value: string): string | null =>
+  value === "" || value === "null" ? null : value;
+
+/**
  * Project `dumpsys package PACKAGE` output. Only the listed fields are
  * extracted; the input is version-dependent and everything else is ignored
  * by design rather than guessed.
@@ -336,7 +351,7 @@ export const parseDumpsysPackageOutput = (
       key === "installerPackageName" &&
       details.installerPackageName === null
     )
-      details.installerPackageName = value === "" ? null : value;
+      details.installerPackageName = absentInstallerOrName(value);
     else if (key === "userId" && details.userId === null) {
       const parsed = /^(\d+)/u.exec(value);
       if (parsed !== null) details.userId = Number(parsed[1]!);
@@ -376,6 +391,14 @@ export const parseBugreportCopiedPath = (stdout: string): string | null => {
   const match = /^Bug report copied to (.+)\r?$/mu.exec(stdout.trim());
   return match === null ? null : match[1]!;
 };
+
+/**
+ * Read the digest from one `sha256sum FILE` line, or null when the output
+ * names none. GNU sha256sum starts the line with a backslash when it escaped
+ * the echoed name; the digest itself is never escaped.
+ */
+export const parseSha256sumOutput = (stdout: string): string | null =>
+  /^\\?([a-f0-9]{64}) [ *]/u.exec(stdout)?.[1] ?? null;
 
 /** Read the device's `Failure [REASON]` verdict from package-change output. */
 export const packageChangeFailureReason = (output: string): string | null =>

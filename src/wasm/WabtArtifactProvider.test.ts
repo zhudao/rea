@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { access, chmod, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { expect, it, vi } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
 import { WabtArtifactProvider } from "./WabtArtifactProvider.js";
 import { wasmArtifactSchema } from "../domain/wasm/wasmArtifact.js";
@@ -194,6 +194,20 @@ const assertModeOutcome = (
   result: Awaited<ReturnType<WabtArtifactProvider["inspect"]>>,
   path: string,
 ): void => {
+  if (mode.startsWith("invalid"))
+    expect(result).toMatchObject({
+      error: {
+        partialObservation: {
+          parameters: { command_timeout_ms: 42_000 },
+          normalized_result: {
+            tool_profile: {
+              timeout_ms: 42_000,
+              output_budget_bytes: WABT_LIMITS.outputBytes,
+            },
+          },
+        },
+      },
+    });
   if (mode === "success")
     expect(result).toMatchObject({
       ok: true,
@@ -228,6 +242,25 @@ const assertModeOutcome = (
     });
 };
 
+const assertValidationCleanupRecovery = async (
+  provider: WabtArtifactProvider,
+  result: Awaited<ReturnType<WabtArtifactProvider["inspect"]>>,
+  cleanupAttempts: () => number,
+): Promise<void> => {
+  expect(result).toMatchObject({ error: { cleanupIncomplete: true } });
+  await provider.close();
+  expect(cleanupAttempts()).toBe(2);
+  if (result.ok) throw new Error("Expected validation failure");
+  expect(result.error.cleanupIncomplete).toBe(false);
+  expect(projectAnalysisError(result.error)).toMatchObject({
+    code: "invalid_request",
+    details: {
+      captured_output: { stderr: "module.wasm: invalid bytes\n" },
+      cleanup_history: expect.any(Object),
+    },
+  });
+};
+
 it("returns actionable unavailable without creating a workspace when tools are absent", async () => {
   const provider = new WabtArtifactProvider({}, undefined, () => {
     throw new Error("Must not allocate");
@@ -246,6 +279,75 @@ it("returns actionable unavailable without creating a workspace when tools are a
     },
   });
 });
+
+it.each([
+  { tool: "wasm-validate", stdout: "1.0.41\n", stderr: "" },
+  { tool: "wasm-objdump", stdout: "", stderr: "" },
+  { tool: "wasm2wat", stdout: "1.0.42\n", stderr: "launcher warning\n" },
+  {
+    tool: "wasm-objdump",
+    stdout: "",
+    stderr: "version launcher failed\n",
+    exitCode: 2,
+  },
+])(
+  "retains the exact rejected $tool version probe and configuration recovery",
+  async ({ tool, stdout, stderr, exitCode = 0 }) => {
+    const root = await realpath(
+      await createTestTempDirectory("rea-wabt-version-recovery-"),
+    );
+    const suffix = process.platform === "win32" ? ".exe" : "";
+    for (const name of ["wasm-validate", "wasm-objdump", "wasm2wat"])
+      await writeFile(join(root, name + suffix), "owned executable seam", {
+        mode: 0o700,
+      });
+    const commands: string[] = [];
+    const provider = new WabtArtifactProvider(
+      { REA_WABT_BIN_DIRECTORY: root },
+      (input) => {
+        expect(input.arguments).toEqual(["--version"]);
+        commands.push(input.command);
+        const selected = input.command === join(root, tool + suffix);
+        return spawnOwnedProviderProcess({
+          ...input,
+          command: process.execPath,
+          arguments: [
+            "-e",
+            `process.stdout.write(${JSON.stringify(selected ? stdout : "1.0.42\n")}); process.stderr.write(${JSON.stringify(selected ? stderr : "")}); process.exit(${String(selected ? exitCode : 0)});`,
+          ],
+          expectedCommand: null,
+        });
+      },
+    );
+    try {
+      const result = await provider.inspect({
+        path: "/must-not-read-before-configuration.wasm",
+        glue_paths: [],
+        candidate_paths: [],
+      });
+      if (result.ok) throw new Error("Expected WABT configuration rejection");
+      const projected = projectAnalysisError(result.error);
+      expect(projected).toMatchObject({
+        code: "capability_unavailable",
+        retryable: false,
+        details: {
+          diagnostics: {
+            configuration_key: "REA_WABT_BIN_DIRECTORY",
+            executable_path: join(root, tool + suffix),
+            tool,
+            expected_version: "1.0.42",
+          },
+          captured_output: { stdout, stderr, truncated: false },
+        },
+      });
+      expect(projected.remediation.action).toContain("--version");
+      expect(projected.remediation.action).toContain("restart");
+      expect(commands.at(-1)).toBe(join(root, tool + suffix));
+    } finally {
+      await provider.close();
+    }
+  },
+);
 
 it("retries a retained input descriptor before admitting the next WABT operation", async () => {
   const root = await createTestTempDirectory("rea-wabt-read-cleanup-");
@@ -468,6 +570,60 @@ const launchWabtOutcome = async (
   return launched;
 };
 
+it("enforces a selected command deadline and completes a corrected retry after cleanup", async () => {
+  const fixture = await createWabtArtifactFixture();
+  let first = true;
+  let runtimePath = "";
+  const provider = new WabtArtifactProvider(
+    { REA_WABT_BIN_DIRECTORY: fixture.selectedRoot },
+    async (input) => {
+      if (first) {
+        first = false;
+        return spawnOwnedProviderProcess({
+          ...input,
+          command: process.execPath,
+          arguments: [
+            "-e",
+            'setTimeout(() => process.stdout.write("1.0.42\\n"), 250)',
+          ],
+          expectedCommand: null,
+        });
+      }
+      return launchWabtOutcome(input, "success", {
+        ...fixture,
+        controller: new AbortController(),
+      });
+    },
+    async () => {
+      const root = await PrivateRuntimeRoot.create({
+        prefix: "rea-wabt-budget-",
+      });
+      runtimePath = root.path;
+      return root;
+    },
+  );
+  onTestFinished(() => provider.close());
+  const input = { path: fixture.path, glue_paths: [], candidate_paths: [] };
+  const timed = await provider.inspect({ ...input, command_timeout_ms: 20 });
+  if (timed.ok) throw new Error("Selected 20 ms deadline was not enforced");
+  expect(projectAnalysisError(timed.error)).toMatchObject({
+    code: "provider_timeout",
+    details: { timeout_ms: 20 },
+    remediation: { action: expect.stringContaining("command_timeout_ms") },
+  });
+  expect(timed.error.cleanupIncomplete).toBe(false);
+  await expect(access(runtimePath)).rejects.toMatchObject({ code: "ENOENT" });
+  const corrected = await provider.inspect({
+    ...input,
+    command_timeout_ms: 2_000,
+  });
+  if (!corrected.ok) throw corrected.error;
+  const report = wasmArtifactSchema.parse(corrected.value.result);
+  expect(report.tool_profile.timeout_ms).toBe(2_000);
+  expect(report.limitations.join(" ")).not.toContain("30-second");
+  await expect(readFile(fixture.path)).resolves.toEqual(fixture.bytes);
+});
+
 const glueSourcesForOutcome = (mode: OutcomeMode) => {
   const literal = 'fetch("./selected.wasm");';
   return mode === "success"
@@ -567,6 +723,7 @@ const runOwnedArtifactOutcome = async (
       path,
       glue_paths: glueInputs.map(({ path }) => path),
       candidate_paths: [],
+      ...(mode.startsWith("invalid") ? { command_timeout_ms: 42_000 } : {}),
     },
     { signal: controller.signal },
   );
@@ -592,21 +749,12 @@ const runOwnedArtifactOutcome = async (
       cleanupAttempts: () => cleanupAttempts,
       cancellationReason: controller.signal.reason,
     });
-  if (mode === "invalid-close-failure") {
-    expect(result).toMatchObject({ error: { cleanupIncomplete: true } });
-    await provider.close();
-    expect(cleanupAttempts).toBe(2);
-    if (!result.ok) {
-      expect(result.error.cleanupIncomplete).toBe(false);
-      expect(projectAnalysisError(result.error)).toMatchObject({
-        code: "invalid_request",
-        details: {
-          captured_output: { stderr: "module.wasm: invalid bytes\n" },
-          cleanup_history: expect.any(Object),
-        },
-      });
-    }
-  }
+  if (mode === "invalid-close-failure")
+    await assertValidationCleanupRecovery(
+      provider,
+      result,
+      () => cleanupAttempts,
+    );
   if (
     mode === "snapshot-close-failure" ||
     mode === "snapshot-read-failure-late-abort"

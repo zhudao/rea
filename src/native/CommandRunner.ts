@@ -17,9 +17,8 @@ import type {
   SpawnedOwnedProviderProcess,
 } from "../process/ProviderProcess.js";
 import { boundedUtf8Text } from "../process/boundedUtf8Text.js";
+import { DEFAULT_NATIVE_COMMAND_TIMEOUT_MS } from "../domain/native/nativeDeadlines.js";
 
-/** Maximum wall-clock duration for one native command. */
-export const NATIVE_COMMAND_TIMEOUT_MS = 60_000;
 /** Retain complete command output up to a bounded aggregate size. */
 export const NATIVE_COMMAND_OUTPUT_BUDGET_BYTES = 64 * 1024 * 1024;
 /**
@@ -127,6 +126,8 @@ export interface NativeCommandFailureCapture {
 export interface NativeCommandOptions {
   readonly signal?: AbortSignal;
   readonly acceptNonZero?: boolean;
+  /** Selected wall clock; omitted uses `DEFAULT_NATIVE_COMMAND_TIMEOUT_MS`. */
+  readonly timeoutMs?: number;
 }
 
 export interface NativeCommandRunner {
@@ -149,6 +150,8 @@ export type NativeToolResolver = (
   tool: string,
   signal?: AbortSignal,
   launcher?: NativeCommandLauncher,
+  /** Selected command deadline. Omitted uses `DEFAULT_NATIVE_COMMAND_TIMEOUT_MS`. */
+  timeoutMs?: number,
 ) => Promise<Result<ResolvedTool, NativeCommandFailure>>;
 
 /** Run allowlisted Xcode tools directly without a shell. */
@@ -161,8 +164,12 @@ export class XcrunCommandRunner implements NativeCommandRunner {
   #cleanupAttempt: Promise<readonly NativeCommandCleanupFailure[]> | undefined;
   constructor(
     environment: Readonly<NodeJS.ProcessEnv>,
-    private readonly resolveTool: NativeToolResolver = (tool, signal) =>
-      resolveXcrunTool(tool, this.environment, signal, this.launcher),
+    private readonly resolveTool: NativeToolResolver = (
+      tool,
+      signal,
+      launcher,
+      timeoutMs,
+    ) => resolveXcrunTool(tool, this.environment, signal, launcher, timeoutMs),
     private readonly launcher?: NativeCommandLauncher,
   ) {
     this.environment = snapshotEnvironment(environment);
@@ -202,6 +209,7 @@ export class XcrunCommandRunner implements NativeCommandRunner {
       tool,
       options.signal,
       this.launcher,
+      options.timeoutMs,
     );
     if (!resolved.ok) {
       return err(this.#retainCleanupOwner(resolved.error));
@@ -363,12 +371,16 @@ export const resolveXcrunTool = async (
   environment: Readonly<NodeJS.ProcessEnv>,
   signal?: AbortSignal,
   launcher?: NativeCommandLauncher,
+  timeoutMs?: number,
 ): Promise<Result<ResolvedTool, NativeCommandFailure>> => {
   const found = await captureProcess(
     "/usr/bin/xcrun",
     ["--find", tool],
     "xcrun",
-    signal === undefined ? {} : { signal },
+    {
+      ...(signal === undefined ? {} : { signal }),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    },
     environment,
     launcher,
   );
@@ -496,6 +508,7 @@ const captureProcess = async (
   options: {
     readonly signal?: AbortSignal;
     readonly acceptNonZero?: boolean;
+    readonly timeoutMs?: number;
   },
   environment: Readonly<NodeJS.ProcessEnv>,
   launcher?: NativeCommandLauncher,
@@ -515,7 +528,7 @@ const captureProcess = async (
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
       {
-        timeoutMs: NATIVE_COMMAND_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs ?? DEFAULT_NATIVE_COMMAND_TIMEOUT_MS,
         diagnosticBytes: NATIVE_COMMAND_OUTPUT_BUDGET_BYTES,
         acceptNonZeroExit: options.acceptNonZero === true,
       },

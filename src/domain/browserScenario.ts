@@ -1,7 +1,9 @@
 import { z } from "zod";
 
+import { webRuntimeCommandTimeoutSchema } from "./browserDeadline.js";
 import {
   browserScenarioActionSchema,
+  BROWSER_SCENARIO_START_STEP_ID,
   browserScenarioBrowserSchema,
   browserScenarioCaptureSchema,
   browserScenarioEnvironmentSchema,
@@ -33,6 +35,7 @@ export const browserScenarioInputSchema = z.strictObject({
       "Optional environment-variable references for values used in actions, URLs, storage, or replay, and for redacting matching observed text. Secret values are never supplied inline.",
     ),
   capture: browserScenarioCaptureSchema,
+  command_timeout_ms: webRuntimeCommandTimeoutSchema,
 });
 
 type ScenarioShape = z.infer<typeof browserScenarioInputSchema>;
@@ -111,6 +114,15 @@ const validateBrowserScenario = (
     "Action step IDs",
     context,
   );
+  const reservedIndex = scenario.actions.findIndex(
+    ({ step_id: id }) => id === BROWSER_SCENARIO_START_STEP_ID,
+  );
+  if (reservedIndex !== -1)
+    addIssue(
+      context,
+      ["actions", reservedIndex, "step_id"],
+      "Action step IDs must not reuse the reserved initial step identity",
+    );
   assertUnique(
     scenario.secrets.map(({ secret_id: id }) => id),
     ["secrets"],

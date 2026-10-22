@@ -31,12 +31,20 @@ import { ProviderSelectionError } from "./providerSelectionError.js";
 import { ProviderAdapterError } from "./providerAdapterError.js";
 import { UnknownRegistryError } from "./unknownRegistryError.js";
 import { providerRetryAction } from "./providerOperationHealth.js";
+import { fixedAllowanceRemediation } from "./fixedAllowanceRemediation.js";
 import {
   resolvedAnalysisError,
   type AnalysisError,
   type AnalysisErrorTag,
 } from "./analysisErrorBase.js";
 import type { AnalysisErrorProjection } from "./analysisErrorProjection.js";
+
+/** File export when one MCP frame cannot carry the retained session bundle. */
+export const MCP_TRANSPORT_EVIDENCE_EXPORT =
+  "Export complete retained session evidence through export_evidence_bundle to a caller-selected path, or use complete CLI JSON output. The connection remains usable.";
+
+/** Next step when one MCP frame cannot carry a complete retained session bundle. */
+export const MCP_TRANSPORT_EVIDENCE_DISCOVERY = `Discover retained records with get_evidence_bundle and detail: summary, then inspect compatible records through inspect_analysis_view using an exact Evidence reference. ${MCP_TRANSPORT_EVIDENCE_EXPORT}`;
 
 export const analysisErrorRemediationAction = (
   error: AnalysisError,
@@ -45,6 +53,11 @@ export const analysisErrorRemediationAction = (
   if (
     (error instanceof ProviderAdapterError ||
       error instanceof AnalysisCapabilityUnavailableError) &&
+    error.remediationAction !== undefined
+  )
+    return error.remediationAction;
+  if (
+    error instanceof BrowserObservationError &&
     error.remediationAction !== undefined
   )
     return error.remediationAction;
@@ -67,15 +80,20 @@ export const analysisErrorRemediationAction = (
   if (error instanceof AnalysisResourceConstraintError)
     return (
       error.remediationAction ??
-      (error.resource === "capacity"
-        ? "Wait for an active analysis to complete, then retry within the reported admission limits."
-        : error.resource === "transport"
-          ? "Discover retained records with get_evidence_bundle and detail: summary, then inspect compatible records through inspect_analysis_view using an exact Evidence reference. Export complete retained session evidence through export_evidence_bundle to a caller-selected path, or use complete CLI JSON output. The connection remains usable."
-          : error.resource === "cpu"
-            ? "Review the reported worker CPU limits and observed signal. Retry with sufficient CPU time or a smaller artifact; REA retains tighter inherited limits."
-            : error.resource === "file-size"
-              ? "Review the reported worker file-size limits and write failure. Retry with a sufficient file-size allowance for the evidence reply; REA retains tighter inherited limits."
-              : "Review the reported worker memory limits and available host memory. Retry with sufficient memory or a smaller artifact; REA retains tighter inherited limits.")
+      (error.fixedAllowance !== undefined
+        ? fixedAllowanceRemediation(
+            error.fixedAllowance.name,
+            error.fixedAllowance.kind,
+          )
+        : error.resource === "capacity"
+          ? "Wait for an active analysis to complete, then retry within the reported admission limits."
+          : error.resource === "transport"
+            ? MCP_TRANSPORT_EVIDENCE_DISCOVERY
+            : error.resource === "cpu"
+              ? "Review the reported worker CPU limits and observed signal. Retry with sufficient CPU time or a smaller artifact; REA retains tighter inherited limits."
+              : error.resource === "file-size"
+                ? "Review the reported worker file-size limits and write failure. Retry with a sufficient file-size allowance for the evidence reply; REA retains tighter inherited limits."
+                : "Review the reported worker memory limits and available host memory. Retry with sufficient memory or a smaller artifact; REA retains tighter inherited limits.")
     );
   if (
     error instanceof AnalysisTimeoutError &&
@@ -100,7 +118,7 @@ export const analysisErrorRemediationAction = (
       ? "Correct the reported address, document, or arguments and retry."
       : "Review the Hopper diagnostic details and correct the request or target; run `rea doctor` if the provider itself is failing. Repeating the unchanged request is not expected to succeed.";
   if (error instanceof EvidenceReferenceError)
-    return "Use an exact Evidence reference retained by this session, supply the complete inline Evidence, re-run its producer, or import its Evidence bundle. close_binary clears retained records.";
+    return "Use an exact Evidence reference available from the selected source, supply the complete inline Evidence, re-run its producer, or select/import its Evidence bundle. close_binary clears a server session's retained records.";
   if (
     error instanceof BinaryTargetError &&
     error.constraint === "directory_requires_file"
@@ -204,6 +222,7 @@ const browserErrorCategory = (
     reason === "target_not_allowed" ||
     reason === "service_worker_blocked" ||
     reason === "target_changed" ||
+    reason === "target_session_detached" ||
     reason === "endpoint_unreachable" ||
     reason === "disconnected"
   )
@@ -267,7 +286,7 @@ export const analysisErrorUserMessage = (error: AnalysisError): string => {
   if (error instanceof ArtifactOperationError) return artifactMessage(error);
   if (error instanceof EvidenceReferenceError)
     return error.reason === "missing"
-      ? `Evidence ${error.evidenceId} is not retained in this session. Supply complete inline Evidence, re-run its producer, or import its bundle before using this reference.`
+      ? `Evidence ${error.evidenceId} is not available from the selected source. Supply complete inline Evidence, re-run its producer, or select/import its bundle before using this reference.`
       : `Evidence ${error.evidenceId} does not match the requested reference (${error.reason}). Check the expected and actual identity in the diagnostic details.`;
   if (error instanceof EvidenceIntegrityError)
     return "Evidence is invalid or has changed. Recreate or re-import it, then try again.";

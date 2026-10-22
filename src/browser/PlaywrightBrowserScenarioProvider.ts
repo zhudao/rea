@@ -14,7 +14,10 @@ import type {
   ProviderIdentity,
 } from "../application/AnalysisProvider.js";
 import type { BrowserScenario } from "../domain/browserScenario.js";
-import type { BrowserScenarioAction } from "../domain/browserScenarioValues.js";
+import {
+  BROWSER_SCENARIO_START_STEP_ID,
+  type BrowserScenarioAction,
+} from "../domain/browserScenarioValues.js";
 import {
   browserScenarioCaptureSchema,
   type BrowserScenarioCapture,
@@ -39,6 +42,10 @@ import type {
   BrowserScenarioSessionOpener,
   BrowserScenarioSessionPort,
 } from "./BrowserScenarioSessionPort.js";
+import {
+  notExecutedActionError,
+  type ScenarioActionStop,
+} from "./ScenarioActionSequence.js";
 import {
   browserScenarioCleanupObservation,
   browserScenarioOperationFailure,
@@ -143,7 +150,7 @@ const initialStep = async (input: {
   );
   return createStep({
     stepIndex: 0,
-    stepId: "scenario_start",
+    stepId: BROWSER_SCENARIO_START_STEP_ID,
     action: "goto_start",
     status: "completed",
     elapsedMs,
@@ -161,14 +168,15 @@ const executeStep = async (input: {
   readonly scenario: BrowserScenario;
   readonly action: BrowserScenarioAction;
   readonly stepIndex: number;
-  readonly priorFailure: boolean;
+  readonly stoppedBy: ScenarioActionStop | undefined;
   readonly signal: AbortSignal | undefined;
 }): Promise<BrowserScenarioStep> => {
-  const { session, scenario, action, stepIndex, priorFailure, signal } = input;
+  const { session, scenario, action, stepIndex, stoppedBy, signal } = input;
   const beforeUrl = session.sanitizeUrl(session.currentUrl());
   const eventStart = session.nextEventSequence();
   const requested = requestedForStep(scenario, stepIndex);
-  if (priorFailure)
+  if (stoppedBy !== undefined) {
+    const error = notExecutedActionError(stoppedBy);
     return createStep({
       stepIndex,
       stepId: action.step_id,
@@ -177,14 +185,12 @@ const executeStep = async (input: {
       elapsedMs: 0,
       beforeUrl,
       afterUrl: beforeUrl,
-      error: "not executed after an earlier action failure",
+      error,
       eventStart,
       eventEnd: session.lastEventSequence(),
-      artifacts: unavailableArtifacts(
-        requested,
-        "action was not executed after an earlier failure",
-      ),
+      artifacts: unavailableArtifacts(requested, error),
     });
+  }
 
   const actionStartedAt = performance.now();
   session.setStep(stepIndex);
@@ -270,18 +276,19 @@ const runScenario = async (
         signal: options.signal,
       }),
     );
-    let failed = false;
+    let stoppedBy: ScenarioActionStop | undefined;
     for (const [offset, action] of scenario.actions.entries()) {
       const step = await executeStep({
         session,
         scenario,
         action,
         stepIndex: offset + 1,
-        priorFailure: failed,
+        stoppedBy,
         signal: options.signal,
       });
       steps.push(step);
-      failed ||= step.status !== "completed";
+      if (stoppedBy === undefined && step.status !== "completed")
+        stoppedBy = step.status;
     }
   } catch (cause: unknown) {
     operationOutcome = { ok: false, cause };

@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { expect, it } from "vitest";
+import { buildBinary } from "plist";
 
 import { inspectPlistSchema } from "../../../../src/domain/native/nativeInspection.js";
 import { ok } from "../../../../src/domain/result.js";
@@ -49,6 +50,8 @@ interface PlistSourceCase {
   readonly xmlFallback: boolean;
   readonly convertedXml?: string;
   readonly expectedValue?: unknown;
+  readonly expectedTools?: readonly string[];
+  readonly expectedLimitations?: readonly unknown[];
 }
 
 it.for<PlistSourceCase>([
@@ -110,8 +113,42 @@ it.for<PlistSourceCase>([
   },
   {
     description: "Apple binary property list\n",
+    contents: Buffer.from(
+      buildBinary({
+        nel: "a\u0085b",
+        ls: "a\u2028b",
+        ps: "a\u2029b",
+        lf: "a\nb",
+        payload: Buffer.from([0]),
+      }),
+    ),
     expected: "binary",
+    xmlFallback: false,
+    expectedTools: ["file"],
+    expectedValue: {
+      nel: "a\u0085b",
+      ls: "a\u2028b",
+      ps: "a\u2029b",
+      lf: "a\nb",
+      payload: { $plist_type: "data", base64: "AA==" },
+    },
+    expectedLimitations: [],
+  },
+  {
+    description: "XML 1.0 document text, ASCII text\n",
+    contents:
+      "<plist><dict><key>nel</key><string>a\u0085b</string><key>ls</key><string>a\u2028b</string><key>ps</key><string>a\u2029b</string><key>lf</key><string>a\nb</string><key>payload</key><data>AA==</data></dict></plist>",
+    expected: "xml",
     xmlFallback: true,
+    convertedXml:
+      "<plist><dict><key>nel</key><string>a\u0085b</string><key>ls</key><string>a\u2028b</string><key>ps</key><string>a\u2029b</string><key>lf</key><string>a\nb</string><key>payload</key><data>AA==</data></dict></plist>",
+    expectedValue: {
+      nel: "a\u0085b",
+      ls: "a\u2028b",
+      ps: "a\u2029b",
+      lf: "a\nb",
+      payload: { $plist_type: "data", base64: "AA==" },
+    },
   },
 ])(
   "keeps source format $expected for $description (XML fallback: $xmlFallback)",
@@ -123,6 +160,8 @@ it.for<PlistSourceCase>([
       xmlFallback,
       convertedXml = XML,
       expectedValue = { ...VALUE, ...(xmlFallback ? { Blob: DATA } : {}) },
+      expectedTools,
+      expectedLimitations,
     },
     { onTestFinished },
   ) => {
@@ -146,10 +185,12 @@ it.for<PlistSourceCase>([
     expect(result.source_path).toBe(path);
     expect(result.value).toEqual(expectedValue);
     expect(result.provenance.map(({ tool }) => tool)).toEqual(
-      xmlFallback ? ["file", "plutil", "plutil"] : ["file", "plutil"],
+      expectedTools ??
+        (xmlFallback ? ["file", "plutil", "plutil"] : ["file", "plutil"]),
     );
     expect(result.limitations).toEqual(
-      xmlFallback ? [expect.stringContaining("XML conversion")] : [],
+      expectedLimitations ??
+        (xmlFallback ? [expect.stringContaining("XML conversion")] : []),
     );
   },
 );

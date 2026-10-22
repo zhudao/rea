@@ -21,15 +21,16 @@ import {
 import { evidenceSchema } from "../evidence.js";
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
+import { digestCanonicalValue } from "../canonicalDigest.js";
 import {
   bridgeCandidateCoverageSchema,
   projectCartesianCandidates,
 } from "../bridgeCandidateProjection.js";
+import type { MobileApplicationProjectionWithSources } from "../mobileApplicationGraphProjection.js";
 import {
   projectedComponentSchema,
   projectedInventoryEntries,
   projectedFileComponents,
-  projectionDigest,
   unavailableComponentSchema,
   type ProjectedInventoryEntry,
 } from "../mobileApplicationGraphProjection.js";
@@ -113,7 +114,7 @@ type RootFormat = (typeof APPLE_ROOT_FORMATS)[number];
 /** Project exact Apple application paths and hashes without parsing or executing target code. */
 export const projectAppleApplication = (
   input: AppleApplicationProjectionInput,
-): AppleApplicationProjectionResult => {
+): MobileApplicationProjectionWithSources<AppleApplicationProjectionResult> => {
   const parsed = appleApplicationProjectionInputSchema.parse(input);
   const { evidence, inventory } = parseArtifactInventoryEvidence(
     parsed.inventory_evidence,
@@ -200,15 +201,18 @@ export const projectAppleApplication = (
     },
     limitations,
   };
-  return appleApplicationProjectionResultSchema.parse({
-    ...withoutId,
-    projection_id: appleProjectionId(withoutId),
-  });
+  return {
+    projection: appleApplicationProjectionResultSchema.parse({
+      ...withoutId,
+      projection_id: appleProjectionId(withoutId),
+    }),
+    sources: evidence,
+  };
 };
 
 /** Identify the complete projection, including source Evidence provenance. */
 export const appleProjectionId = (projection: unknown): string =>
-  `aap_${digest(projection)}`;
+  `aap_${digestCanonicalValue(projection, "Apple application projection")}`;
 
 /**
  * AppleDouble sidecars describe neighbouring files and are never components.
@@ -438,6 +442,3 @@ const projectionLimitations = (facts: {
   "Bridge candidates are path-based hypotheses, not observed runtime calls.",
   "A bridge basis is inferred from the native path and is repeated for every managed component.",
 ];
-
-const digest = (value: unknown): string =>
-  projectionDigest(value, "Apple application projection");

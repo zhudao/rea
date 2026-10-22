@@ -90,6 +90,7 @@ const subjectFormatSchema = z.enum([
   "unknown",
   "javascript-bundle",
   "entitlements",
+  "pyinstaller",
 ]);
 // Snapshot entries retain the same raw-only architecture boundary as targets.
 const subjectSchema = z.discriminatedUnion("format", [
@@ -343,6 +344,37 @@ interface SnapshotExecution {
   readonly subject: EvidenceSubjectTarget | null;
 }
 
+type SnapshotExecutionProjection = Pick<
+  AnalysisSnapshotEntry["execution"],
+  | "result"
+  | "raw_result"
+  | "provider"
+  | "limitations"
+  | "relationship_coverage"
+  | "locations"
+  | "subject"
+>;
+
+/** Project one authenticated execution into the shared persisted snapshot shape. */
+const snapshotExecutionProjection = (
+  execution: SnapshotExecution,
+  provider: AnalysisSnapshotEntry["execution"]["provider"],
+): SnapshotExecutionProjection => ({
+  result: execution.result,
+  raw_result: execution.rawResult,
+  provider,
+  limitations: [...execution.limitations],
+  relationship_coverage: execution.relationshipCoverage ?? null,
+  locations: [...execution.locations],
+  subject:
+    execution.subject === null
+      ? null
+      : subjectSchema.parse({
+          ...execution.subject,
+          architecture: execution.subject.architecture ?? null,
+        }),
+});
+
 const canonicalJson = (value: unknown): string => {
   const json = jsonValueSchema.parse(value);
   const encoded = canonicalize(json);
@@ -488,20 +520,11 @@ export const createAnalysisSnapshotWorkflowEntry = (input: {
     operation,
     parameters: jsonObjectSchema.parse(parameters),
     execution: {
-      result: execution.result,
-      raw_result: execution.rawResult,
-      provider: execution.analysisProfile.provider,
+      ...snapshotExecutionProjection(
+        execution,
+        execution.analysisProfile.provider,
+      ),
       analysis_profile: execution.analysisProfile,
-      limitations: [...execution.limitations],
-      relationship_coverage: execution.relationshipCoverage ?? null,
-      locations: [...execution.locations],
-      subject:
-        execution.subject === null
-          ? null
-          : subjectSchema.parse({
-              ...execution.subject,
-              architecture: execution.subject.architecture ?? null,
-            }),
     },
   };
 };
@@ -551,21 +574,7 @@ export const createAnalysisSnapshotEntry = (input: {
     query_id: analysisQueryId(target, binding, operation, parameters),
     operation,
     parameters: jsonObjectSchema.parse(parameters),
-    execution: {
-      result: execution.result,
-      raw_result: execution.rawResult,
-      provider: binding.provider,
-      limitations: [...execution.limitations],
-      relationship_coverage: execution.relationshipCoverage ?? null,
-      locations: [...execution.locations],
-      subject:
-        execution.subject === null
-          ? null
-          : subjectSchema.parse({
-              ...execution.subject,
-              architecture: execution.subject.architecture ?? null,
-            }),
-    },
+    execution: snapshotExecutionProjection(execution, binding.provider),
   };
 };
 

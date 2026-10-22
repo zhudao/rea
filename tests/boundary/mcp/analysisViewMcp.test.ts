@@ -61,6 +61,8 @@ const connect = async (
   const server = createServer(
     { kind: "session", session },
     {
+      // These schema conformance cases exercise full nested constraints.
+      environment: { ...process.env, REA_MCP_INPUT_SCHEMA_PROFILE: "full" },
       ...(binaryLayout === undefined ? {} : { binaryLayout }),
       ...(webNetworkCapture === undefined ? {} : { webNetworkCapture }),
     },
@@ -318,6 +320,9 @@ it("discovers an oversized native dossier by exact metadata and reads its retain
   expect(broadError.code).toBe("resource_constraint");
   expect(broadError.remediation?.action).toContain(
     "get_evidence_bundle and detail: summary",
+  );
+  expect(broadError.remediation?.action).toContain(
+    "REA_MCP_MAX_RESPONSE_BYTES",
   );
   const response = await client.callTool({
     name: "get_evidence_bundle",

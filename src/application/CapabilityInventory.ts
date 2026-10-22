@@ -415,6 +415,7 @@ const workflowAvailabilityFor = ({
     name === "inspect_go_binary" ||
     name === "inspect_il2cpp_metadata" ||
     name === "inspect_model_artifact" ||
+    name === "inspect_gpu_code_objects" ||
     name === "inspect_rust_binary" ||
     name === "inspect_electron_fuses"
   )
@@ -685,6 +686,7 @@ const targetAvailability = ({
   targetKind,
   targetFormat,
   targetOpen,
+  descriptors,
 }: AvailabilityContext): Availability | null => {
   if (FRIDA_OPERATION_NAMES.has(name)) return null;
   if (!targetOpen && ACTIVE_TARGET_KINDS.has(kind))
@@ -692,6 +694,14 @@ const targetAvailability = ({
       reason: "target_required",
       remediation: "Call open_binary with a supported local target.",
     };
+  const descriptor = descriptors.get(name);
+  if (
+    targetOpen &&
+    descriptor?.available === false &&
+    (descriptor.availability_code === "target_kind_unsupported" ||
+      descriptor.availability_code === "target_format_unsupported")
+  )
+    return { reason: "target_unsupported", remediation: descriptor.reason };
   if (
     targetKind !== undefined &&
     targetKind !== "executable" &&

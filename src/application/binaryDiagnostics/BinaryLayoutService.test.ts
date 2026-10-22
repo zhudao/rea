@@ -25,10 +25,18 @@ it.each([
         throw new Error("must not run");
       },
     });
-    expect(await service.inspect(input)).toMatchObject({
+    const result = await service.inspect(input);
+    expect(result).toMatchObject({
       ok: false,
       error: { _tag: "AnalysisInputError" },
     });
+    if (input.path === "relative.elf")
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          issues: [{ path: ["path"], reason: "invalid_format" }],
+        },
+      });
   },
 );
 
@@ -62,6 +70,33 @@ it("preserves a provider's actionable unsupported reason", async () => {
     inspect: () => Promise.resolve(err(failure)),
   });
   expect(await service.inspect({ path: "/source.elf" })).toEqual(err(failure));
+});
+
+it("preserves the caller's exact abort reason before invocation", async () => {
+  const controller = new AbortController();
+  const reason = Object.freeze({ requested: "layout-stop" });
+  controller.abort(reason);
+  let calls = 0;
+  const service = new BinaryLayoutService({
+    inspectAndClose(input, options) {
+      return this.inspect(input, options);
+    },
+    identity: BINARY_LAYOUT_TEST_PROVIDER,
+    inspect: () => {
+      calls++;
+      return Promise.resolve(ok(binaryLayoutFixture()));
+    },
+  });
+  const result = await service.inspect(
+    { path: "/artifacts/source-owned.elf" },
+    { signal: controller.signal },
+  );
+  expect(result).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisCancelledError" },
+  });
+  expect(result.ok ? undefined : result.error.cause).toBe(reason);
+  expect(calls).toBe(0);
 });
 
 it("cancels before invocation and after an acquired observation", async () => {

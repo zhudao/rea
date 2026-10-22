@@ -1,14 +1,14 @@
 import type { Document, Node } from "@xmldom/xmldom";
-import { MAX_PLIST_DEPTH } from "./apple/plistValue.js";
+import {
+  MAX_PLIST_DEPTH,
+  plistNestingLimitMessage,
+} from "./apple/plistValue.js";
 import { err, ok, type Result } from "./result.js";
-import { parseXmlDocument } from "./xmlDocument.js";
+import { parseXmlDocument, XML_LINE_ENDING } from "./xmlDocument.js";
 import {
   decodeXmlPlistData,
   XmlPlistDataError,
 } from "./propertyListXmlData.js";
-
-// Preserve DOM compatibility normalization while retaining raw scalar spans.
-const LINE_ENDING = /\r[\n\u0085]|[\r\n\u0085\u2028\u2029]/gu;
 
 interface ScalarSpan {
   readonly start: number;
@@ -25,14 +25,14 @@ export class XmlPlistSourceError extends TypeError {
 
 /** One source owner binds lexical scalar values to their validated DOM nodes. */
 export const readXmlPlistSource = (text: string) => {
-  const normalized = text.replace(LINE_ENDING, "\n");
+  const normalized = text.replace(XML_LINE_ENDING, "\n");
   const parsed = parseXmlDocument(normalized, {
     doctype: "allow",
     lineEndings: "preserve",
   });
   if (!parsed.ok) throw parsed.error;
   const document = parsed.value;
-  const lineEndings = new RegExp(LINE_ENDING);
+  const lineEndings = new RegExp(XML_LINE_ENDING);
   let line = 1;
   let lineStart = 0;
   // The depth walk visits elements in source order, so location lookup is
@@ -179,9 +179,7 @@ const collectXmlPlistScalarSpans = (
       pending.push({ node: node.nextSibling, depth });
     if (node.nodeType !== node.ELEMENT_NODE) continue;
     if (node.nodeName !== "key" && depth > MAX_PLIST_DEPTH)
-      throw new RangeError(
-        `Plist exceeds ${String(MAX_PLIST_DEPTH)} nesting levels`,
-      );
+      throw new RangeError(plistNestingLimitMessage());
     if (PLIST_LEXICAL_SCALARS.has(node.nodeName))
       spans.set(node, readSpan(node));
     if (PLIST_CONTAINER_ELEMENTS.has(node.nodeName) && node.firstChild !== null)

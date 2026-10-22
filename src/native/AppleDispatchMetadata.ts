@@ -24,7 +24,7 @@ import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
+import { fixedNativeAllowance } from "../domain/native/nativeDeadlines.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import {
@@ -44,6 +44,7 @@ import {
   createSwiftRelativeReader,
   decodeSwiftDispatchFacets,
   type DispatchRecordBudget,
+  type SwiftRelativeTargetLocation,
 } from "./AppleSwiftDispatchFacets.js";
 import { decodeSwiftClassVtables } from "./AppleSwiftVtables.js";
 import { inspectObjcClassImportBindings } from "./AppleObjcClassImportBindings.js";
@@ -97,6 +98,16 @@ export const decodeAppleDispatchMetadata = (
     address: `0x${address.toString(16)}`,
     file_offset: offset(address),
   });
+  const targetLocation = (address: bigint): SwiftRelativeTargetLocation => {
+    let fileOffset: number | null;
+    try {
+      fileOffset = offset(address);
+    } catch (cause) {
+      if (!(cause instanceof RangeError)) throw cause;
+      fileOffset = null;
+    }
+    return { address: `0x${address.toString(16)}`, file_offset: fileOffset };
+  };
   const evidence = (address: bigint, description: string) => [
     {
       kind: "binary_metadata" as const,
@@ -164,6 +175,7 @@ export const decodeAppleDispatchMetadata = (
     bound,
     string,
     location,
+    targetLocation,
     evidence,
     offset,
   };
@@ -261,11 +273,12 @@ export const inspectAppleDispatchMetadata = async (
     new AnalysisResourceConstraintError(
       "inspect_native_dispatch_metadata",
       "memory",
-      "Apple static metadata input exceeds its 64 MiB snapshot budget",
+      `Apple static metadata input exceeds its ${String(maximumBytes)}-byte (64 MiB) snapshot budget. This release has no runtime override.`,
       { input_bytes: maximumBytes },
-      fixedAllowanceOptions(
+      fixedNativeAllowance(
         "The Apple static metadata snapshot allowance",
         "parser",
+        `${String(maximumBytes)} bytes`,
       ),
     );
   const cancelled = () =>

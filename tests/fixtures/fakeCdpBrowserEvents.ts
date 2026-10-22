@@ -78,15 +78,18 @@ const emitMainWebMcpTools = (
             ? options.webMcpConsequential
             : true,
         },
-        stackTrace: {
-          callFrames: [
-            {
-              url: `http://127.0.0.1:${String(port)}/app.js?token=tool-source-secret`,
-              lineNumber: 12,
-              columnNumber: 4,
-            },
-          ],
-        },
+        stackTrace:
+          options.webMcpStackTrace !== undefined
+            ? options.webMcpStackTrace(`http://127.0.0.1:${String(port)}`)
+            : {
+                callFrames: [
+                  {
+                    url: `http://127.0.0.1:${String(port)}/app.js?token=tool-source-secret`,
+                    lineNumber: 12,
+                    columnNumber: 4,
+                  },
+                ],
+              },
       },
       {
         name: "private_tool",
@@ -305,6 +308,8 @@ const emitSessionTimeline = (
         sessionId: command.sessionId,
         targetId: "allowed-page",
       });
+    if (options.sessionTimeline === "target_crashed")
+      event(socket, "Inspector.targetCrashed", command.sessionId, {});
   }
 };
 
@@ -668,6 +673,9 @@ const emitRuntimeEvents = (
               description: "object-secret",
             },
           ]
+        : []),
+      ...(options.nullConsoleArgument === true
+        ? [{ type: "object", subtype: "null", value: null }]
         : []),
     ],
     stackTrace: {

@@ -1,19 +1,12 @@
-import { createHash } from "node:crypto";
-
-import canonicalize from "canonicalize";
 import { z } from "zod";
 
 import {
   hasCompleteInventoryCoverage,
   type ParsedInventorySet,
 } from "./artifactInventoryEvidence.js";
-import { evidenceSchema } from "./evidence.js";
+import { evidenceSchema, type Evidence } from "./evidence.js";
 import { digestSchema } from "./digests.js";
 import { prefixedDigestSchema } from "./digests.js";
-import {
-  bridgeCandidateCoverageSchema,
-  projectCartesianCandidates,
-} from "./bridgeCandidateProjection.js";
 
 /** Evidence-scoped identifier schemas shared by application graph projections. */
 export const projectionEvidenceIdSchema = prefixedDigestSchema("ev");
@@ -43,6 +36,12 @@ export const unavailableComponentSchema = z.strictObject({
 });
 
 export type ProjectedComponent = z.infer<typeof projectedComponentSchema>;
+
+/** A projection and the authenticated source Evidence used to derive it. */
+export interface MobileApplicationProjectionWithSources<Projection> {
+  readonly projection: Projection;
+  readonly sources: readonly Evidence[];
+}
 
 /** Path-pair hypotheses connecting managed content to a native library. */
 export const projectedBridgeCandidateSchema = <
@@ -139,13 +138,3 @@ export const projectedFileComponents = (
       ? [component]
       : [],
   );
-
-export { bridgeCandidateCoverageSchema, projectCartesianCandidates };
-
-/** Digest a canonical JSON projection payload for its stable identifier. */
-export const projectionDigest = (value: unknown, label: string): string => {
-  const encoded = canonicalize(value);
-  if (encoded === undefined)
-    throw new TypeError(`${label} is not canonical JSON`);
-  return createHash("sha256").update(encoded).digest("hex");
-};

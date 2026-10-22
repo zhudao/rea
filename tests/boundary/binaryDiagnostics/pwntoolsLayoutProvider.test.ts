@@ -86,6 +86,15 @@ it.runIf(!unsupportedHost).each([
     expect(projected.remediation.action).toContain(
       resource === "cpu" ? "CPU" : "file-size",
     );
+    if (resource === "file-size") {
+      expect(projected.remediation.action).toContain("outputBytes");
+      expect(projected.remediation.action).toContain("67108864");
+      expect(projected.remediation.action).toContain("file_size_bytes");
+      expect(projected.remediation.action).not.toContain("address-space");
+      expect(projected.remediation.action).not.toContain("3221225472");
+      if (scenario === "reported")
+        expect(projected.remediation.action).toContain("1024");
+    }
     await expect(access(ownedPath)).rejects.toMatchObject({ code: "ENOENT" });
   },
 );
@@ -123,10 +132,10 @@ it.runIf(!unsupportedHost)(
     if (result.ok) throw new Error("Expected compounded lifecycle failure");
     expect(result.error).toMatchObject({
       cleanupIncomplete: true,
+      capturedOutput: { truncated: true, stderr: "" },
       diagnostics: {
         primary_error: {
           code: "unreadable_output",
-          details: { captured_output: { truncated: true, stderr: "" } },
         },
         cleanup_error: {
           code: "cleanup_incomplete",
@@ -136,6 +145,22 @@ it.runIf(!unsupportedHost)(
         },
       },
     });
+    const projected = projectAnalysisError(result.error);
+    expect(projected.details?.captured_output).toEqual(
+      result.error.capturedOutput,
+    );
+    expect(projected).not.toHaveProperty(
+      "details.diagnostics.primary_error.details.captured_output",
+    );
+    const output = result.error.capturedOutput?.stdout;
+    if (!output) throw new Error("Expected retained truncated worker output");
+    // Preserve the cleanup owner's separate snapshot, but not a redundant
+    // captured_output copy in generic primary history.
+    expect(projected).toHaveProperty(
+      "details.diagnostics.cleanup_error.details.diagnostics.captured_output.stdout",
+      output,
+    );
+    expect(JSON.stringify(projected).split(output)).toHaveLength(3);
     await expect(access(ownedPath)).resolves.toBeUndefined();
     cleanupAllowed = true;
     await provider.close();
@@ -297,7 +322,8 @@ it.runIf(!unsupportedHost).each([
     );
     const result = await provider.inspect({ path });
     if (result.ok) throw new Error("Expected resource failure");
-    expect(projectAnalysisError(result.error)).toMatchObject({
+    const projected = projectAnalysisError(result.error);
+    expect(projected).toMatchObject({
       code: "resource_constraint",
       category: "resource_constraint",
       details: {
@@ -309,6 +335,8 @@ it.runIf(!unsupportedHost).each([
         },
       },
     });
+    expect(projected.remediation.action).toContain("memory");
+    expect(projected.remediation.action).toContain("address-space");
     await expect(access(ownedPath)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(path, "utf8")).toBe("source-owned-seam-bytes");
   },

@@ -13,6 +13,7 @@ import type { FirmwareRequest } from "../domain/firmware/firmwareAnalysis.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { readBoundedFileBytes } from "../process/BoundedFileBytes.js";
 import { FIRMWARE_LIMITS } from "./FirmwareRelease.js";
+import { firmwareLimitRecovery } from "./FirmwareFailures.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import type { SafeOutputTree } from "../artifacts/SafeOutputTree.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
@@ -188,7 +189,11 @@ export class FirmwareFileAccess {
     );
   }
 
-  /** Read a complete bounded report; oversized data is never reported as complete. */
+  /**
+   * Read a complete bounded report; oversized data is never reported as complete.
+   * Each refusal records its observed report state, so an absent or empty report
+   * is never conflated with an empty scan or a malformed one.
+   */
   async report(
     path: string,
     operation: string,
@@ -201,11 +206,14 @@ export class FirmwareFileAccess {
           FIRMWARE_LIMITS.reportBytes,
         );
         if (bytes === undefined)
-          throw new AnalysisOutputError(
+          throw firmwareReportFailure(
             operation,
+            "oversized",
             `Report exceeded ${FIRMWARE_LIMITS.reportBytes} bytes`,
           );
         assertArtifactReadActive(signal);
+        if (bytes.length === 0)
+          throw firmwareReportFailure(operation, "empty", "Report is empty");
         try {
           const value: unknown = JSON.parse(
             new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
@@ -214,24 +222,56 @@ export class FirmwareFileAccess {
           );
           return value;
         } catch (cause: unknown) {
-          throw new AnalysisOutputError(
+          throw firmwareReportFailure(
             operation,
+            "invalid_json",
             "Tool report is not valid complete JSON",
-            { cause },
+            cause,
           );
         }
       }).catch((cause: unknown) => {
-        throw firmwareAdmissionFailure(
-          cause,
-          (primary) =>
-            new AnalysisOutputError(operation, "Report is not a regular file", {
-              cause: primary,
-            }),
+        throw mapArtifactFileFailure(cause, (primary) =>
+          primary instanceof NonRegularFileReadError
+            ? firmwareReportFailure(
+                operation,
+                "not_regular_file",
+                "Report is not a regular file",
+                primary,
+              )
+            : primary instanceof Error &&
+                "code" in primary &&
+                primary.code === "ENOENT"
+              ? firmwareReportFailure(
+                  operation,
+                  "missing",
+                  "Report was not created",
+                  primary,
+                )
+              : primary,
         );
       }),
     );
   }
 }
+
+/** Observed state of a producer report that cannot supply analysis Evidence. */
+type FirmwareReportState =
+  | "missing"
+  | "empty"
+  | "oversized"
+  | "invalid_json"
+  | "not_regular_file";
+
+const firmwareReportFailure = (
+  operation: string,
+  state: FirmwareReportState,
+  reason: string,
+  cause?: unknown,
+) =>
+  new AnalysisOutputError(operation, reason, {
+    cause,
+    diagnostics: { report_state: state },
+  });
 
 /** Preserve admission semantics inside the same exact owner's physical outcome. */
 const firmwareAdmissionFailure = (
@@ -243,14 +283,16 @@ const firmwareAdmissionFailure = (
   );
 };
 
-const firmwareInputFailure = (operation: string, cause?: unknown) =>
-  new AnalysisInputError(operation, { cause }, [
+const firmwareInputFailure = (operation: string, cause?: unknown) => {
+  const message = `Firmware must be a nonempty regular file no larger than ${String(FIRMWARE_LIMITS.inputBytes)} bytes. Select a stable copy within this allowance. ${firmwareLimitRecovery(`The firmware input allowance is ${String(FIRMWARE_LIMITS.inputBytes)} bytes`)}`;
+  return new AnalysisInputError(operation, { cause, userMessage: message }, [
     {
       path: ["path"],
       reason: "out_of_range",
-      message: `Firmware must be a nonempty regular file no larger than ${FIRMWARE_LIMITS.inputBytes} bytes. Select a stable copy within this allowance.`,
+      message,
     },
   ]);
+};
 
 /** Inventory private output without following links, enforcing aggregate staging budgets. */
 export const inventoryFirmwareOutput = async (

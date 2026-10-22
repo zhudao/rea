@@ -121,7 +121,7 @@ const fixture = (
 const provenance = { path: "/fixture/app", sha256: "a".repeat(64) };
 
 const swiftExternalSwiftBindingImage = (
-  boundField: "protocol" | "type" = "protocol",
+  boundField: "protocol" | "type" | "objc-class" = "protocol",
 ) => {
   const bytes = fixture();
   const sectionCommand = 32;
@@ -141,7 +141,9 @@ const swiftExternalSwiftBindingImage = (
   const bind = Buffer.from([
     0x11, // SET_DYLIB_ORDINAL_IMM 1
     0x40,
-    ...Buffer.from(`${boundField === "protocol" ? "_$sSQMp" : "_$sSiMn"}\0`),
+    ...Buffer.from(
+      `${boundField === "protocol" ? "_$sSQMp" : boundField === "objc-class" ? "_OBJC_CLASS_$_NSObject" : "_$sSiMn"}\0`,
+    ),
     0x70,
     0x80,
     0x16, // SET_SEGMENT_AND_OFFSET_ULEB segment 0 + offset 0xb00
@@ -163,12 +165,15 @@ const swiftExternalSwiftBindingImage = (
   bytes.writeInt32LE(0x10, 0xa00);
   bytes.writeInt32LE(boundField === "protocol" ? 0x1ec : 0xec, 0xa14);
   bytes.writeInt32LE(0, 0xa18); // Nullable witness-table pattern.
-  bytes.writeUInt32LE(boundField === "protocol" ? 0 : 8, 0xa1c);
+  bytes.writeUInt32LE(
+    boundField === "protocol" ? 0 : boundField === "objc-class" ? 24 : 8,
+    0xa1c,
+  );
   bytes.writeInt32LE(boundField === "protocol" ? 0xf1 : 0x2f0, 0xa10); // Protocol reference: imported indirect slot or local descriptor.
   bytes.writeBigUInt64LE(0n, 0xb00); // Bound slot has no in-image pointer.
   bytes.writeUInt32LE(16, 0xc00);
   bytes.writeInt32LE(0x1f8, 0xc08);
-  if (boundField === "type") {
+  if (boundField !== "protocol") {
     bytes.writeUInt32LE(3, 0xd00);
     bytes.writeInt32LE(0xf8, 0xd08);
     bytes.write("Equatable\0", 0xe00);
@@ -237,6 +242,28 @@ const swiftBoundWitnessSlotImage = () => {
   return bytes;
 };
 
+const swiftConformanceTypeReferenceImage = (
+  typeKind: number,
+  input: {
+    readonly typeTargetOffset?: number;
+    readonly indirectClassTargetOffset?: number;
+  } = {},
+) => {
+  const bytes = swiftBoundWitnessSlotImage();
+  const typeTargetOffset = input.typeTargetOffset ?? 0xe60;
+  bytes.writeUInt32LE(typeKind << 3, 0xa1c);
+  bytes.writeInt32LE(typeTargetOffset - 0xa14, 0xa14);
+  if (typeKind === 2 && typeTargetOffset === 0xe60) {
+    bytes.write("NSObject\0", typeTargetOffset);
+  } else if (typeKind === 3 && typeTargetOffset === 0xe60) {
+    bytes.writeBigUInt64LE(
+      base + BigInt(input.indirectClassTargetOffset ?? 0xe80),
+      typeTargetOffset,
+    );
+  }
+  return bytes;
+};
+
 describe("Swift imported protocol references", () => {
   it("preserves bind identity without reading VM address zero and marks coverage partial", () => {
     const result = decodeAppleDispatchMetadata(
@@ -282,6 +309,7 @@ describe("Swift imported protocol references", () => {
     expect(result.swift_conformances).toMatchObject([
       {
         type_name: null,
+        type_reference_kind: 1,
         type_binding: {
           symbol: "_$sSiMn",
           requested_address: "0x100000b00",
@@ -296,6 +324,27 @@ describe("Swift imported protocol references", () => {
         ({ facet }) => facet === "swift_conformances_static_witness_slots",
       ),
     ).toMatchObject({ status: "partial" });
+  });
+
+  it("preserves a kind-3 Objective-C class import without inventing a class name", () => {
+    const result = decodeAppleDispatchMetadata(
+      swiftExternalSwiftBindingImage("objc-class"),
+      100,
+      provenance,
+    );
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: null,
+        type_reference_kind: 3,
+        type_reference_target: { address: null, file_offset: null },
+        type_binding: {
+          symbol: "_OBJC_CLASS_$_NSObject",
+          requested_address: "0x100000b00",
+        },
+        protocol_name: "Equatable",
+        decode: { status: "partial" },
+      },
+    ]);
   });
 
   it("reports only the legacy stream mechanisms actually examined", () => {
@@ -325,6 +374,8 @@ describe("Swift imported protocol references", () => {
     expect(result.swift_conformances).toMatchObject([
       {
         type_name: "Widget",
+        type_reference_kind: 0,
+        type_reference_target: { address: "0x100000c00", file_offset: 3072 },
         protocol_name: "Equatable",
         witness_table: { address: "0x100000e00" },
         decode: { status: "decoded" },
@@ -348,6 +399,360 @@ describe("Swift imported protocol references", () => {
       ),
     ).toMatchObject({ status: "partial" });
   });
+});
+
+describe("Swift conformance type-reference kinds", () => {
+  it.each([
+    {
+      label: "zero rebase",
+      target: 0n,
+      rebase: true,
+      address: "0x0",
+      fileOffset: 0,
+    },
+    {
+      label: "nonzero rebase",
+      target: 0x100n,
+      rebase: true,
+      address: "0x100",
+      fileOffset: 256,
+    },
+    {
+      label: "unmapped rebase",
+      target: 0x800n,
+      rebase: true,
+      address: "0x800",
+      fileOffset: null,
+    },
+    {
+      label: "raw zero",
+      target: 0n,
+      rebase: false,
+      address: null,
+      fileOffset: null,
+    },
+    {
+      label: "raw nonzero",
+      target: 0x100n,
+      rebase: false,
+      address: "0x100",
+      fileOffset: 256,
+    },
+  ])(
+    "preserves kind-3 target identity for $label",
+    ({ target, rebase, address, fileOffset }) => {
+      const bytes = Buffer.alloc(1024);
+      bytes.writeUInt32LE(0xfeedfacf, 0);
+      bytes.writeUInt32LE(0x0100000c, 4);
+      bytes.writeUInt32LE(6, 12); // MH_DYLIB; read statically, never executed.
+      bytes.writeUInt32LE(2, 16);
+      bytes.writeUInt32LE(200, 20);
+      bytes.writeUInt32LE(0x19, 32); // LC_SEGMENT_64, mapping address zero.
+      bytes.writeUInt32LE(152, 36);
+      bytes.write("__TEXT", 40);
+      bytes.writeBigUInt64LE(1024n, 64);
+      bytes.writeBigUInt64LE(1024n, 80);
+      bytes.writeUInt32LE(5, 88);
+      bytes.writeUInt32LE(5, 92);
+      bytes.writeUInt32LE(1, 96);
+      bytes.write("__swift5_proto", 104);
+      bytes.write("__TEXT", 120);
+      bytes.writeBigUInt64LE(0x200n, 136);
+      bytes.writeBigUInt64LE(4n, 144);
+      bytes.writeUInt32LE(0x200, 152);
+      bytes.writeUInt32LE(2, 156);
+      bytes.writeUInt32LE(0x80000022, 184); // LC_DYLD_INFO_ONLY.
+      bytes.writeUInt32LE(48, 188);
+      if (rebase) {
+        bytes.writeUInt32LE(0x380, 192);
+        bytes.writeUInt32LE(6, 196);
+        // Pointer rebase at segment 0 + 0x300, then end the stream.
+        Buffer.from([0x11, 0x20, 0x80, 0x06, 0x51, 0x00]).copy(bytes, 0x380);
+      }
+      bytes.writeInt32LE(0x20, 0x200); // Conformance descriptor at 0x220.
+      bytes.writeInt32LE(0x40, 0x220); // Protocol descriptor at 0x260.
+      bytes.writeInt32LE(0xdc, 0x224); // Indirect class cell at 0x300.
+      bytes.writeUInt32LE(3 << 3, 0x22c);
+      bytes.writeUInt32LE(3, 0x260); // Protocol context descriptor.
+      bytes.writeInt32LE(0x18, 0x268);
+      bytes.write("FixtureProtocol\0", 0x280);
+      bytes.writeBigUInt64LE(target, 0x300);
+
+      const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+      expect(result.swift_conformances).toMatchObject([
+        {
+          type_reference_kind: 3,
+          type_reference_target: { address, file_offset: fileOffset },
+          type_name: null,
+          type_binding: null,
+          protocol_name: "FixtureProtocol",
+          protocol_target: { address: "0x260", file_offset: 608 },
+          witness_table: { address: null, file_offset: null },
+          decode: {
+            status: "partial",
+            reason:
+              "Indirect Objective-C class metadata requires runtime lookup",
+          },
+        },
+      ]);
+      expect(result.swift_conformances).toHaveLength(1);
+      expect(result.swift_dispatch_slots).toEqual([]);
+      expect(result.relative_pointers).toContainEqual(
+        expect.objectContaining({
+          field: { address: "0x224", file_offset: 548 },
+          target: { address: "0x300", file_offset: 768 },
+        }),
+      );
+    },
+  );
+
+  it("keeps a direct Objective-C class name and its local witness evidence", () => {
+    const result = decodeAppleDispatchMetadata(
+      swiftConformanceTypeReferenceImage(2),
+      100,
+      provenance,
+    );
+
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: "NSObject",
+        type_reference_kind: 2,
+        type_reference_target: { address: "0x100000e60", file_offset: 3680 },
+        protocol_name: "Equatable",
+        witness_table: { address: "0x100000e00" },
+        decode: { status: "decoded" },
+      },
+    ]);
+    expect(result.swift_dispatch_slots[0]).toMatchObject({
+      owner: "NSObject: Equatable",
+      table_kind: "witness_table",
+      implementation_address: null,
+      implementation_binding: {
+        symbol: "_externalWitnessImpl",
+        requested_address: "0x100000e08",
+      },
+    });
+  });
+});
+
+describe("Swift partial conformance reference retention", () => {
+  it("retains type and witness facts when the protocol target is unmapped", () => {
+    const bytes = swiftConformanceTypeReferenceImage(2);
+    bytes.writeInt32LE(0x5000 - 0xa10, 0xa10);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: "NSObject",
+        type_reference_target: { address: "0x100000e60", file_offset: 3680 },
+        protocol_name: null,
+        protocol_target: { address: "0x100005000", file_offset: null },
+        witness_table: { address: "0x100000e00", file_offset: 3584 },
+        decode: { status: "partial" },
+      },
+    ]);
+    expect(result.swift_dispatch_slots).toEqual([]);
+  });
+
+  it("preserves a typed type binding beside an unmapped protocol without a guessed name", () => {
+    const bytes = swiftExternalSwiftBindingImage("objc-class");
+    bytes.writeInt32LE(0x5000 - 0xa10, 0xa10);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: null,
+        type_reference_kind: 3,
+        type_reference_target: { address: null, file_offset: null },
+        type_binding: {
+          symbol: "_OBJC_CLASS_$_NSObject",
+          requested_address: "0x100000b00",
+        },
+        protocol_name: null,
+        protocol_target: { address: "0x100005000", file_offset: null },
+        decode: { status: "partial" },
+      },
+    ]);
+  });
+
+  it("retains protocol and type targets when the protocol name is unmapped", () => {
+    const bytes = swiftConformanceTypeReferenceImage(2);
+    bytes.writeInt32LE(0x5000 - 0xd08, 0xd08);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: "NSObject",
+        protocol_name: null,
+        protocol_target: { address: "0x100000d00", file_offset: 3328 },
+        witness_table: { address: "0x100000e00", file_offset: 3584 },
+        decode: { status: "partial" },
+      },
+    ]);
+    expect(result.swift_dispatch_slots).toEqual([]);
+  });
+
+  it("retains other facts when the protocol descriptor kind is unsupported", () => {
+    const bytes = swiftConformanceTypeReferenceImage(2);
+    bytes.writeUInt32LE(4, 0xd00);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: "NSObject",
+        protocol_name: null,
+        protocol_target: { address: "0x100000d00", file_offset: 3328 },
+        witness_table: { address: "0x100000e00", file_offset: 3584 },
+        decode: { status: "partial" },
+      },
+    ]);
+  });
+
+  it("retains other facts when a protocol name is invalid UTF-8", () => {
+    const bytes = swiftConformanceTypeReferenceImage(2);
+    bytes.writeUInt8(0xff, 0xe50);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: "NSObject",
+        protocol_name: null,
+        protocol_target: { address: "0x100000d00", file_offset: 3328 },
+        witness_table: { address: "0x100000e00", file_offset: 3584 },
+        decode: { status: "partial" },
+      },
+    ]);
+  });
+
+  it("retains mixed readable witness slots when a later slot is unmapped", () => {
+    const bytes = swiftConformanceTypeReferenceImage(2);
+    bytes.writeUInt32LE(2, 0xd10);
+    bytes.writeInt32LE(0xff0 - 0xa18, 0xa18);
+    bytes.writeBigUInt64LE(base + 0xa10n, 0xff0);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: "NSObject",
+        protocol_name: "Equatable",
+        witness_table: { address: "0x100000ff0", file_offset: 4080 },
+      },
+    ]);
+    expect(result.swift_dispatch_slots).toMatchObject([
+      {
+        slot_index: 1,
+        location: { address: "0x100000ff8", file_offset: 4088 },
+      },
+    ]);
+    expect(result.swift_dispatch_slots).toHaveLength(1);
+    expect(
+      result.coverage.find(
+        ({ facet }) => facet === "swift_conformances_static_witness_slots",
+      ),
+    ).toMatchObject({ status: "partial" });
+  });
+});
+
+describe("Swift unresolved conformance type references", () => {
+  it.each([3, 4, 7] as const)(
+    "retains an unresolved type-reference kind %i with conformance and witness locations",
+    (typeKind) => {
+      const result = decodeAppleDispatchMetadata(
+        swiftConformanceTypeReferenceImage(typeKind),
+        100,
+        provenance,
+      );
+
+      expect(result.swift_conformances).toMatchObject([
+        {
+          type_name: null,
+          type_reference_kind: typeKind,
+          ...(typeKind === 3
+            ? {
+                type_reference_target: {
+                  address: "0x100000e80",
+                  file_offset: 3712,
+                },
+              }
+            : {}),
+          protocol_name: "Equatable",
+          witness_table: { address: "0x100000e00" },
+          decode: { status: "partial" },
+        },
+      ]);
+      expect(result.swift_dispatch_slots).toEqual([]);
+      expect(
+        result.coverage.find(
+          ({ facet }) => facet === "swift_conformances_static_witness_slots",
+        ),
+      ).toMatchObject({ status: "partial" });
+    },
+  );
+
+  it("retains a kind-2 source location when its inline class name is empty", () => {
+    const bytes = swiftConformanceTypeReferenceImage(2);
+    bytes.writeUInt8(0, 0xe60);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+
+    expect(result.swift_conformances).toMatchObject([
+      {
+        type_name: null,
+        type_reference_kind: 2,
+        type_reference_target: { address: "0x100000e60", file_offset: 3680 },
+        protocol_name: "Equatable",
+        witness_table: { address: "0x100000e00" },
+        decode: { status: "partial" },
+      },
+    ]);
+    expect(result.swift_dispatch_slots).toEqual([]);
+  });
+
+  it.each([
+    { kind: 0, target: 0x5000, actual: 0x5000 },
+    { kind: 1, target: 0x5000, actual: 0x5000 },
+    { kind: 2, target: 0x5000, actual: 0x5000 },
+    { kind: 3, target: 0x5000, actual: 0x5000 },
+    {
+      kind: 3,
+      target: 0xe60,
+      indirectClassTarget: 0x5000,
+      actual: 0x5000,
+    },
+    { kind: 4, target: 0x5000, actual: 0x5000 },
+  ])(
+    "retains partial conformance evidence when kind $kind targets non-file-backed address $target",
+    ({ kind, target, indirectClassTarget, actual }) => {
+      const result = decodeAppleDispatchMetadata(
+        swiftConformanceTypeReferenceImage(kind, {
+          typeTargetOffset: target,
+          ...(indirectClassTarget === undefined
+            ? {}
+            : { indirectClassTargetOffset: indirectClassTarget }),
+        }),
+        100,
+        provenance,
+      );
+
+      expect(result.swift_conformances).toMatchObject([
+        {
+          type_name: null,
+          type_reference_kind: kind,
+          type_reference_target: {
+            address: `0x${(base + BigInt(actual)).toString(16)}`,
+            file_offset: null,
+          },
+          protocol_name: "Equatable",
+          witness_table: { address: "0x100000e00" },
+          decode: { status: "partial" },
+        },
+      ]);
+      expect(result.swift_dispatch_slots).toEqual([]);
+      expect(
+        result.coverage.find(
+          ({ facet }) => facet === "swift_conformances_static_witness_slots",
+        ),
+      ).toMatchObject({ status: "partial" });
+    },
+  );
 });
 
 const withProtocolListSection = (bytes: Buffer): Buffer => {

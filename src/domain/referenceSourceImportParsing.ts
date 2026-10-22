@@ -6,6 +6,7 @@ import type {
   StringLiteral,
 } from "@babel/types";
 import { traverseJavaScriptAst } from "./javascript/javascriptSemanticTraversal.js";
+import { readExactJavaScriptLiteral } from "./javascript/javascriptAstValues.js";
 import {
   parseRecoveredJavaScript,
   parserPluginsForPath,
@@ -92,8 +93,10 @@ const moduleSpecifierFromExpression = (
 ):
   | { specifier: string; parseState: ReferenceSourceImportParseState }
   | undefined => {
-  if (isStringLiteral(expression))
-    return { specifier: expression.value, parseState: "parsed" };
+  if (expression === null || expression === undefined) return undefined;
+  const literal = readExactJavaScriptLiteral(expression);
+  if (literal.found && typeof literal.value === "string")
+    return { specifier: literal.value, parseState: "parsed" };
   if (
     isCallExpression(expression) &&
     isImport(expression.callee) &&
@@ -110,6 +113,7 @@ const moduleSpecifierFromExpression = (
 
 const appendRelationship = (
   relationships: ReferenceSourceImportRelationship[],
+  limitations: string[],
   input: {
     readonly fromPath: string;
     readonly to: string | undefined;
@@ -120,6 +124,12 @@ const appendRelationship = (
   },
 ): void => {
   if (input.to === undefined) return;
+  if (input.to.length === 0) {
+    limitations.push(
+      `Empty module specifier in ${input.fromPath} was not recorded as a relationship.`,
+    );
+    return;
+  }
   relationships.push({
     from_path: input.fromPath,
     to: input.to,
@@ -136,10 +146,11 @@ const extractImportDeclarations = (
   body: readonly Node[],
   from_path: string,
   relationships: ReferenceSourceImportRelationship[],
+  limitations: string[],
 ): void => {
   for (const statement of body) {
     if (isImportDeclaration(statement)) {
-      appendRelationship(relationships, {
+      appendRelationship(relationships, limitations, {
         fromPath: from_path,
         to: safeModuleName(statement.source),
         kind: "imports",
@@ -150,7 +161,7 @@ const extractImportDeclarations = (
 
     if (isExportNamedDeclaration(statement)) {
       if (statement.source !== null && statement.source !== undefined) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: safeModuleName(statement.source),
           kind: "imports",
@@ -161,7 +172,7 @@ const extractImportDeclarations = (
     }
 
     if (isExportAllDeclaration(statement)) {
-      appendRelationship(relationships, {
+      appendRelationship(relationships, limitations, {
         fromPath: from_path,
         to: safeModuleName(statement.source),
         kind: "imports",
@@ -173,7 +184,7 @@ const extractImportDeclarations = (
     if (isTSImportEqualsDeclaration(statement)) {
       const reference = statement.moduleReference;
       if (isTSExternalModuleReference(reference)) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: safeModuleName(reference.expression),
           kind: "requires",
@@ -185,7 +196,7 @@ const extractImportDeclarations = (
 
     if (isTSModuleDeclaration(statement)) {
       if (statement.declare === true && isStringLiteral(statement.id)) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: statement.id.value,
           kind: "declares-module",
@@ -220,6 +231,7 @@ const extractRequireAndDynamicImports = (
   body: readonly Node[],
   from_path: string,
   relationships: ReferenceSourceImportRelationship[],
+  limitations: string[],
   unshadowedRequireCalls: ReadonlySet<CallExpression>,
 ): void => {
   // Single traversal owner: iterative, VISITOR_KEYS-gated, no recursion over
@@ -237,7 +249,7 @@ const extractRequireAndDynamicImports = (
   for (const call of expressions) {
     if (isImportExpression(call)) {
       const specifier = safeModuleName(call.source);
-      appendRelationship(relationships, {
+      appendRelationship(relationships, limitations, {
         fromPath: from_path,
         to: specifier ?? "<dynamic-import>",
         kind: "imports",
@@ -247,14 +259,13 @@ const extractRequireAndDynamicImports = (
       continue;
     }
     const first = call.arguments[0];
-    if (
-      isRequireCallee(call.callee) &&
-      unshadowedRequireCalls.has(call) &&
-      isModuleExpression(first)
-    ) {
+    // The shared exact-literal reader owns argument exactness: it unwraps
+    // runtime-transparent TS wrappers (`as const`, `!`, `satisfies`) and
+    // admits quoted and expression-free template spellings alike.
+    if (isRequireCallee(call.callee) && unshadowedRequireCalls.has(call)) {
       const result = moduleSpecifierFromExpression(first);
       if (result !== undefined) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: result.specifier,
           kind: "requires",
@@ -268,7 +279,7 @@ const extractRequireAndDynamicImports = (
     if (isImport(call.callee) && isModuleExpression(first)) {
       const result = moduleSpecifierFromExpression(first);
       if (result !== undefined) {
-        appendRelationship(relationships, {
+        appendRelationship(relationships, limitations, {
           fromPath: from_path,
           to: result.specifier,
           kind: "imports",
@@ -371,11 +382,12 @@ export const parseReferenceSourceImports = (
   }
 
   const relationships: ReferenceSourceImportRelationship[] = [];
-  extractImportDeclarations(ast.program.body, path, relationships);
+  extractImportDeclarations(ast.program.body, path, relationships, limitations);
   extractRequireAndDynamicImports(
     ast.program.body,
     path,
     relationships,
+    limitations,
     unshadowedReferenceSourceRequireCalls(ast, path),
   );
 

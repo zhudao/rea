@@ -20,6 +20,10 @@ import {
 import { SafeOutputTree } from "../../artifacts/SafeOutputTree.js";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
 import {
+  AnalysisAccessDeniedError,
+  AnalysisOutputError,
+} from "../../domain/analysisErrorCore.js";
+import {
   exportEnvironmentBundle,
   readEnvironmentExportInputs,
 } from "./environmentExport.js";
@@ -186,11 +190,117 @@ it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
         error: {
           _tag: "AnalysisAccessDeniedError",
           operation: "environment-export",
+          diagnostics: { output_directory: directory },
         },
       });
       expect(await readdir(directory)).toEqual([]);
     } finally {
       await chmod(directory, 0o700);
+    }
+  },
+);
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "names the nested path when write permission is lost after earlier files",
+  async () => {
+    const root = await createTestTempDirectory("rea-bundle-later-denied-");
+    const files = await writeEnvironmentServeFiles(root);
+    const inputs = await readEnvironmentExportInputs(
+      files.manifestPath,
+      files.capturePath,
+    );
+    if (!inputs.ok) throw inputs.error;
+    const directory = join(root, "bundle");
+    const original = SafeOutputTree.prototype.write;
+    let writes = 0;
+    // The real host refuses the second file once the directory is read-only.
+    const writer = vi
+      .spyOn(SafeOutputTree.prototype, "write")
+      .mockImplementation(async function (this: SafeOutputTree, ...args) {
+        writes += 1;
+        if (writes === 2) await chmod(directory, 0o500);
+        return original.apply(this, args);
+      });
+    try {
+      const result = await exportEnvironmentBundle({
+        ...inputs.value,
+        source: environmentServeSource(),
+        directory,
+      });
+      if (result.ok) throw new Error("expected a permission refusal");
+      expect(result.error).toMatchObject({
+        _tag: "AnalysisAccessDeniedError",
+        diagnostics: { output_directory: directory },
+      });
+      if (!(result.error instanceof AnalysisAccessDeniedError))
+        throw result.error;
+      expect(result.error.path.startsWith(`${directory}/`)).toBe(true);
+      expect(await readdir(directory)).not.toEqual([]);
+    } finally {
+      writer.mockRestore();
+      await chmod(directory, 0o700);
+    }
+  },
+);
+
+it.each([
+  {
+    failure: "pathless descriptor failure",
+    // A disk-full `FileHandle.write()` reports a code and syscall, no path.
+    error: () =>
+      Object.assign(new Error("ENOSPC: no space left on device, write"), {
+        code: "ENOSPC",
+        syscall: "write",
+      }),
+  },
+  {
+    failure: "integrity refusal",
+    error: () =>
+      new ArtifactReaderFailure(
+        "integrity",
+        "Extracted content disagrees with inventory",
+      ),
+  },
+] as const)(
+  "reports a later $failure with its own recovery",
+  async ({ failure, error }) => {
+    const root = await createTestTempDirectory("rea-bundle-later-failure-");
+    const files = await writeEnvironmentServeFiles(root);
+    const inputs = await readEnvironmentExportInputs(
+      files.manifestPath,
+      files.capturePath,
+    );
+    if (!inputs.ok) throw inputs.error;
+    const directory = join(root, "bundle");
+    const original = SafeOutputTree.prototype.write;
+    const targets: string[] = [];
+    const writer = vi
+      .spyOn(SafeOutputTree.prototype, "write")
+      .mockImplementation(async function (this: SafeOutputTree, ...args) {
+        targets.push(args[0]);
+        if (targets.length === 2) throw error();
+        return original.apply(this, args);
+      });
+    try {
+      const result = await exportEnvironmentBundle({
+        ...inputs.value,
+        source: environmentServeSource(),
+        directory,
+      });
+      if (result.ok || !(result.error instanceof AnalysisOutputError))
+        throw new Error("expected an output failure");
+      expect(result.error.diagnostics).toEqual({
+        output_directory: directory,
+      });
+      if (failure === "pathless descriptor failure") {
+        expect(result.error.reason).toContain(
+          join(directory, targets[1] ?? ""),
+        );
+        expect(result.error.remediationAction).toContain("free disk space");
+      } else expect(result.error.remediationAction).toBeUndefined();
+      expect(await readdir(directory)).not.toEqual([]);
+    } finally {
+      writer.mockRestore();
     }
   },
 );

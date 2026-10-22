@@ -1,3 +1,4 @@
+import { WorkerFrameSignal } from "../process/WorkerFrameSignal.js";
 import { createHash, randomUUID } from "node:crypto";
 import { open, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -30,7 +31,7 @@ import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { jsonParts, bufferedJsonParts } from "../domain/jsonSerialization.js";
 import { javaScriptRuntime } from "../domain/runtimeVersion.js";
 import { err, ok, type Result } from "../domain/result.js";
-import type { IncludedScript } from "../domain/webBundleAnalyzerInspection.js";
+import type { IncludedScript } from "../domain/webBundleAnalyzerState.js";
 import {
   webBundleScriptAnalysisSchema,
   type WebBundleScriptAnalysis,
@@ -42,6 +43,17 @@ import { ProviderStartupDeadline } from "../process/ProviderDeadline.js";
 import { prepareProcessOwnershipInspection } from "../process/ProcessOwnershipObservation.js";
 import { javaScriptWorkerMemoryLimitBytes } from "../process/JavaScriptWorkerMemoryLimit.js";
 import {
+  DEFAULT_WEB_BUNDLE_HEAP_MB,
+  MAX_WEB_BUNDLE_HEAP_MB,
+  MIN_WEB_BUNDLE_HEAP_MB,
+  webBundleFixedByteBudget,
+  webBundleHeapExhaustedReason,
+  webBundleHeapExhaustedRemediation,
+  webBundleMemoryExhaustion,
+  webBundleResultAdmissionFailure,
+  webBundleScriptTimeoutRecovery,
+} from "../domain/webBundleAnalysis.js";
+import {
   WEB_BUNDLE_WORKER_LIMITS,
   webBundleWorkerMessageSchema,
   webBundleWorkerRequestSchema,
@@ -50,6 +62,15 @@ import {
 
 const OPERATION = "analyze_web_bundle";
 const PROVIDER = "web-bundle-static-analysis";
+
+const scriptTimeout = (
+  timeoutMs: number,
+  cause?: unknown,
+): AnalysisTimeoutError =>
+  new AnalysisTimeoutError(OPERATION, timeoutMs, {
+    ...(cause === undefined ? {} : { cause }),
+    ...webBundleScriptTimeoutRecovery(timeoutMs),
+  });
 const MIB = 1024 * 1024;
 /** Source/result buffers, decoded strings, parsed objects and validation copies. */
 const RESULT_EXPANSION = 16;
@@ -75,6 +96,7 @@ type WebBundleObservedFailure =
       readonly kind: "exit";
       readonly code: number | null;
       readonly signal: NodeJS.Signals | null;
+      readonly memoryLimitReached: boolean;
       readonly heapExhaustion: boolean;
     };
 
@@ -118,7 +140,7 @@ export class WebBundleAnalysisWorker {
   #activeDeadline: ProviderStartupDeadline | undefined;
   #activeJob: WebBundleActiveJob | undefined;
   #activeTerminalResponseObserved = false;
-  readonly #frameWaiters = new Set<(outcome: "frame" | "failure") => void>();
+  readonly #frameSignal = new WorkerFrameSignal();
   #retainedResultBytes = 0;
   #ready = false;
   readonly #stdout = (chunk: Buffer | string): void => {
@@ -130,7 +152,12 @@ export class WebBundleAnalysisWorker {
         Buffer.byteLength(chunk) + Buffer.byteLength(this.#pending) >
         WEB_BUNDLE_WORKER_LIMITS.protocolBytes
       )
-        throw new RangeError("Web analyzer exceeded its control-frame budget");
+        throw new RangeError(
+          webBundleFixedByteBudget(
+            WEB_BUNDLE_WORKER_LIMITS.protocolBytes,
+            "control-frame budget",
+          ),
+        );
       this.#pending +=
         typeof chunk === "string" ? chunk : this.#decoder.write(chunk);
       for (;;) {
@@ -146,22 +173,26 @@ export class WebBundleAnalysisWorker {
         this.#observeFrame(this.#frames.at(-1)!);
         this.#pending = this.#pending.slice(end + 1);
       }
-      this.#wakeFrameWaiters("frame");
+      this.#frameSignal.wake("frame");
     } catch (cause) {
       this.#pending = "";
       this.#protocolFailure = cause;
       this.#latchFailure({ kind: "protocol", cause });
-      this.#wakeFrameWaiters("failure");
+      this.#frameSignal.wake("failure");
     }
   };
 
   constructor(
-    readonly heapMb = 1024,
+    readonly heapMb = DEFAULT_WEB_BUNDLE_HEAP_MB,
     launcher: typeof spawnOwnedProviderProcess = spawnOwnedProviderProcess,
   ) {
-    if (!Number.isSafeInteger(heapMb) || heapMb < 128 || heapMb > 16_384)
+    if (
+      !Number.isSafeInteger(heapMb) ||
+      heapMb < MIN_WEB_BUNDLE_HEAP_MB ||
+      heapMb > MAX_WEB_BUNDLE_HEAP_MB
+    )
       throw new RangeError(
-        "Web analyzer heap must be an integer from 128 through 16384 MiB",
+        `Web analyzer heap must be an integer from ${String(MIN_WEB_BUNDLE_HEAP_MB)} through ${String(MAX_WEB_BUNDLE_HEAP_MB)} MiB (max_heap_mb)`,
       );
     this.#runtime = new OwnedWorkerRuntime({
       rootPrefix: "rea-web-bundle-analysis-",
@@ -170,7 +201,7 @@ export class WebBundleAnalysisWorker {
       onInputFailure: (cause) => {
         if (this.#activeDeadline?.interruption !== undefined) return;
         this.#latchFailure({ kind: "input", cause });
-        this.#wakeFrameWaiters("failure");
+        this.#frameSignal.wake("failure");
       },
       supervisorOptions: {
         captureStdout: false,
@@ -182,12 +213,15 @@ export class WebBundleAnalysisWorker {
             (event.code !== 0 || event.signal !== null)
           ) {
             const stderr = event.snapshot.stderr.text;
+            const memoryLimitReached =
+              event.snapshot.memoryLimitReached === true;
             this.#latchFailure({
               kind: "exit",
               code: event.code,
               signal: event.signal,
+              memoryLimitReached,
               heapExhaustion:
-                event.snapshot.memoryLimitReached === true ||
+                memoryLimitReached ||
                 /heap out of memory|heap limit|allocation failed/iu.test(
                   stderr,
                 ),
@@ -199,19 +233,24 @@ export class WebBundleAnalysisWorker {
                 !this.#activeTerminalResponseObserved)
             )
               this.#latchFailure({ kind: "incomplete-output" });
-            this.#wakeFrameWaiters("failure");
+            this.#frameSignal.wake("failure");
           } else if (event.type === "output") {
             const failure = this.#observedFailure;
-            if (
-              failure?.kind === "exit" &&
-              (this.#runtime.supervisor?.snapshot().memoryLimitReached ===
-                true ||
-                (event.stream === "stderr" &&
-                  /heap out of memory|heap limit|allocation failed/iu.test(
-                    this.#runtime.supervisor?.snapshot().stderr.text ?? "",
-                  )))
-            )
-              this.#observedFailure = { ...failure, heapExhaustion: true };
+            if (failure?.kind !== "exit") return;
+            const memoryLimitReached =
+              this.#runtime.supervisor?.snapshot().memoryLimitReached === true;
+            const heapMarker =
+              event.stream === "stderr" &&
+              /heap out of memory|heap limit|allocation failed/iu.test(
+                this.#runtime.supervisor?.snapshot().stderr.text ?? "",
+              );
+            if (!memoryLimitReached && !heapMarker) return;
+            this.#observedFailure = {
+              ...failure,
+              heapExhaustion: true,
+              memoryLimitReached:
+                failure.memoryLimitReached || memoryLimitReached,
+            };
           }
         },
       },
@@ -257,27 +296,12 @@ export class WebBundleAnalysisWorker {
     try {
       if (signal?.aborted)
         throw new AnalysisCancelledError(OPERATION, { cause: signal.reason });
-      const resultBudget = Math.min(
-        WEB_BUNDLE_WORKER_LIMITS.resultBytes - this.#retainedResultBytes,
-        Math.max(
-          0,
-          Math.floor(
-            (getHeapStatistics().heap_size_limit -
-              process.memoryUsage().heapUsed -
-              64 * MIB) /
-              RESULT_EXPANSION,
-          ),
-        ),
-      );
-      if (resultBudget <= 0) {
+      const admitted = this.#admittedResultBudget();
+      if (!admitted.ok) {
         continuation = "result_capacity_exhausted";
-        throw new AnalysisResourceConstraintError(
-          OPERATION,
-          "memory",
-          "The host has no remaining reserved web-analysis result capacity",
-          { result_bytes: WEB_BUNDLE_WORKER_LIMITS.resultBytes },
-        );
+        throw admitted.error;
       }
+      const resultBudget = admitted.bytes;
       await prepareProcessOwnershipInspection(signal);
       deadline = new ProviderStartupDeadline(timeoutMs, signal);
       this.#activeDeadline = deadline;
@@ -383,7 +407,7 @@ export class WebBundleAnalysisWorker {
       const cancellationCause = this.#completedReadCancellation(cause);
       const interrupted =
         deadline?.interruption === "timeout"
-          ? new AnalysisTimeoutError(OPERATION, timeoutMs, { cause })
+          ? scriptTimeout(timeoutMs, cause)
           : cancellationCause !== undefined
             ? new AnalysisCancelledError(OPERATION, {
                 cause: cancellationCause.reason,
@@ -464,6 +488,41 @@ export class WebBundleAnalysisWorker {
     return result.ok ? result : failed(result.error);
   }
 
+  #admittedResultBudget():
+    | { readonly ok: true; readonly bytes: number }
+    | { readonly ok: false; readonly error: AnalysisResourceConstraintError } {
+    const fixedRemaining =
+      WEB_BUNDLE_WORKER_LIMITS.resultBytes - this.#retainedResultBytes;
+    const hostCapacity = Math.max(
+      0,
+      Math.floor(
+        (getHeapStatistics().heap_size_limit -
+          process.memoryUsage().heapUsed -
+          64 * MIB) /
+          RESULT_EXPANSION,
+      ),
+    );
+    const bytes = Math.min(fixedRemaining, hostCapacity);
+    if (bytes > 0) return { ok: true, bytes };
+    const failure = webBundleResultAdmissionFailure({
+      fixedBudgetBytes: WEB_BUNDLE_WORKER_LIMITS.resultBytes,
+      fixedRemainingBytes: fixedRemaining,
+      hostCapacityBytes: hostCapacity,
+    });
+    return {
+      ok: false,
+      error: new AnalysisResourceConstraintError(
+        OPERATION,
+        "memory",
+        failure.reason,
+        failure.reportedLimits,
+        failure.kind === "host-capacity"
+          ? { remediationAction: failure.remediationAction }
+          : undefined,
+      ),
+    };
+  }
+
   async #writeSource(
     path: string,
     script: IncludedScript,
@@ -485,7 +544,10 @@ export class WebBundleAnalysisWorker {
             throw new AnalysisResourceConstraintError(
               OPERATION,
               "transport",
-              "Captured script metadata and source exceed the worker transfer budget",
+              webBundleFixedByteBudget(
+                WEB_BUNDLE_WORKER_LIMITS.sourceBytes,
+                "worker transfer budget",
+              ),
               { source_bytes: WEB_BUNDLE_WORKER_LIMITS.sourceBytes },
             );
           await handle.writeFile(chunk);
@@ -544,7 +606,7 @@ export class WebBundleAnalysisWorker {
   ): Promise<WebBundleWorkerMessage> {
     for (;;) {
       if (deadline.interruption === "timeout")
-        throw new AnalysisTimeoutError(OPERATION, deadline.timeoutMs);
+        throw scriptTimeout(deadline.timeoutMs);
       if (deadline.interruption === "cancelled")
         throw new AnalysisCancelledError(OPERATION, {
           cause: deadline.signal.reason,
@@ -579,7 +641,7 @@ export class WebBundleAnalysisWorker {
           const completedFrame = this.#frames.shift();
           if (completedFrame !== undefined) return completedFrame;
           throw deadline.interruption === "timeout"
-            ? new AnalysisTimeoutError(OPERATION, deadline.timeoutMs)
+            ? scriptTimeout(deadline.timeoutMs)
             : new AnalysisCancelledError(OPERATION, {
                 cause: deadline.signal.reason,
               });
@@ -671,18 +733,31 @@ export class WebBundleAnalysisWorker {
               { capturedOutput },
             );
       case "exit":
-        if (failure.heapExhaustion)
+        if (failure.heapExhaustion) {
+          const exhaustion = webBundleMemoryExhaustion({
+            runtime: javaScriptRuntime(process.versions).id,
+            heapMb: this.heapMb,
+            memoryLimitReached: failure.memoryLimitReached,
+            processMemoryLimitBytes: javaScriptWorkerMemoryLimitBytes(
+              this.heapMb,
+            ),
+          });
           return new AnalysisResourceConstraintError(
             OPERATION,
             "memory",
-            "Owned web analyzer exhausted its configured memory limit",
+            webBundleHeapExhaustedReason(exhaustion),
             {
               worker_heap_limit_mb: this.heapMb,
+              max_heap_mb: this.heapMb,
               worker_process_memory_limit_bytes:
                 javaScriptWorkerMemoryLimitBytes(this.heapMb),
             },
-            { capturedOutput },
+            {
+              capturedOutput,
+              remediationAction: webBundleHeapExhaustedRemediation(exhaustion),
+            },
           );
+        }
         return new AnalysisOutputError(
           OPERATION,
           "Owned web analyzer exited before completing this script",
@@ -706,41 +781,12 @@ export class WebBundleAnalysisWorker {
     };
   }
 
-  #wakeFrameWaiters(outcome: "frame" | "failure"): void {
-    for (const wake of this.#frameWaiters) wake(outcome);
-    this.#frameWaiters.clear();
-  }
-
   async #waitForFrameOrOutputClose(
     supervisor: NonNullable<OwnedWorkerRuntime["supervisor"]>,
     deadline: ProviderStartupDeadline,
   ): Promise<"frame" | "failure" | "closed" | "interrupted"> {
     if (this.#frames.length > 0) return "frame";
-    let wakeFrame!: (outcome: "frame" | "failure") => void;
-    const frameAvailable = new Promise<"frame" | "failure">((resolve) => {
-      wakeFrame = resolve;
-      this.#frameWaiters.add(wakeFrame);
-    });
-    const outputCloseController = new AbortController();
-    const interruptOutputClose = () =>
-      outputCloseController.abort(deadline.signal.reason);
-    if (deadline.signal.aborted) interruptOutputClose();
-    else
-      deadline.signal.addEventListener("abort", interruptOutputClose, {
-        once: true,
-      });
-    try {
-      const outputClose = supervisor
-        .waitForOutputClose(undefined, outputCloseController.signal)
-        .then((closed): "closed" | "interrupted" =>
-          closed ? "closed" : "interrupted",
-        );
-      return await Promise.race([frameAvailable, outputClose]);
-    } finally {
-      outputCloseController.abort();
-      deadline.signal.removeEventListener("abort", interruptOutputClose);
-      this.#frameWaiters.delete(wakeFrame);
-    }
+    return this.#frameSignal.waitForOutputClose(supervisor, deadline.signal);
   }
 
   #completedSnapshot(cause: unknown): StableArtifactSnapshot | undefined {
@@ -801,7 +847,7 @@ export class WebBundleAnalysisWorker {
     this.#activeDeadline = undefined;
     this.#activeJob = undefined;
     this.#activeTerminalResponseObserved = false;
-    this.#wakeFrameWaiters("failure");
+    this.#frameSignal.wake("failure");
   }
 
   #cleanupFailure(cause: unknown, primary?: AnalysisError): AnalysisError {

@@ -14,15 +14,20 @@ export class BrowserObservationError extends AnalysisError {
   override cleanupIncomplete: boolean;
   override readonly userCategory: "cancelled" | undefined;
   override readonly userMessage: string | undefined;
+  readonly remediationAction: string | undefined;
 
   constructor(
     readonly operation: BrowserObservationOperation,
     readonly reason: BrowserObservationFailureReason,
-    options?: AnalysisErrorOptions & { readonly detail?: string },
+    options?: AnalysisErrorOptions & {
+      readonly detail?: string;
+      readonly remediationAction?: string;
+    },
   ) {
     super(`Browser observation ${operation} failed: ${reason}`, options);
     this.userMessage =
       options?.detail ?? observationFailureMessage(operation, reason);
+    this.remediationAction = options?.remediationAction;
     this.cleanupIncomplete =
       this.cleanup !== undefined || reason === "cleanup_failed";
     this.setCleanupResources(
@@ -51,6 +56,8 @@ const observationFailureMessage = (
     return `${operation} could not reach the selected loopback debugging endpoint. Verify that the target process is running with debugging enabled and that the endpoint's port matches it, then retry.`;
   if (reason === "target_not_found")
     return `${operation} could not find the selected target at the debugging endpoint. Refresh target discovery for that endpoint and retry with a returned target ID.`;
+  if (reason === "target_session_detached")
+    return `${operation} lost its debugging session while the target may still exist. Refresh target discovery and attach to the selected target again.`;
   if (reason === "service_worker_blocked")
     return `${operation} refused the selected page because it is controlled by or has a registered service worker while the service-worker policy is block. Set environment.service_workers to allow to permit observation, or remove the service worker registration through the browser.`;
   if (reason === "disconnected")

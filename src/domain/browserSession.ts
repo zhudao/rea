@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { webRuntimeCommandTimeoutSchema } from "./browserDeadline.js";
 import {
   browserAllowedOriginsSchema,
   browserObservationEndpointSchema,
@@ -13,6 +14,7 @@ export const observeWebSessionInputSchema = z.strictObject({
   allowed_origins: browserAllowedOriginsSchema,
   target_id: z.string().trim().min(1),
   observation_ms: z.number().int().min(1).default(10_000),
+  command_timeout_ms: webRuntimeCommandTimeoutSchema,
 });
 export type ObserveWebSessionInput = z.infer<
   typeof observeWebSessionInputSchema
@@ -29,6 +31,8 @@ const timelineEventSchema = z.object({
     "load_failed",
     "lifecycle",
     "target_terminated",
+    "session_detached",
+    "transport_disconnected",
   ]),
   timestamp: z
     .number()
@@ -63,6 +67,8 @@ export const webObservationSessionSchema = z.object({
       "window_elapsed",
       "target_left_scope",
       "target_terminated",
+      "session_detached",
+      "transport_disconnected",
     ]),
   }),
   timeline: z.array(timelineEventSchema),

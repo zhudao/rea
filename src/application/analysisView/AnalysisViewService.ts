@@ -1,5 +1,6 @@
 import { setImmediate } from "node:timers/promises";
 import { INSPECT_ANALYSIS_VIEW_OPERATION } from "../../domain/analysisView/analysisViewErrors.js";
+import { jsonValueSchema } from "../../domain/jsonValue.js";
 import { z } from "zod";
 
 import { ANALYSIS_VIEW_PROVIDER } from "../InvestigationProviders.js";
@@ -25,7 +26,6 @@ import {
   type AnalysisViewRequest,
   type InspectAnalysisViewInput,
 } from "../../domain/analysisView/analysisView.js";
-import { jsonValueSchema } from "../../domain/jsonValue.js";
 import {
   immutableJsonSnapshotMember,
   isImmutableJsonSnapshot,
@@ -97,7 +97,11 @@ export const inspectAnalysisViewValidatedWithFiles = async (
   };
   // A request cancelled during authentication reports cancellation, even when authentication failed.
   if (await cancelled())
-    return err(new AnalysisCancelledError(INSPECT_ANALYSIS_VIEW_OPERATION));
+    return err(
+      new AnalysisCancelledError(INSPECT_ANALYSIS_VIEW_OPERATION, {
+        cause: options.signal?.reason,
+      }),
+    );
   if (!loaded.ok) return loaded;
   const id = loaded.value.evidence_id;
   const projected = inspectAnalysisViewValidated(
@@ -105,9 +109,13 @@ export const inspectAnalysisViewValidatedWithFiles = async (
     (evidenceId) => (evidenceId === id ? loaded.value : lookup?.(evidenceId)),
   );
   // A request cancelled during projection delivers and records nothing.
-  return (await cancelled())
-    ? err(new AnalysisCancelledError(INSPECT_ANALYSIS_VIEW_OPERATION))
-    : projected;
+  if (await cancelled())
+    return err(
+      new AnalysisCancelledError(INSPECT_ANALYSIS_VIEW_OPERATION, {
+        cause: options.signal?.reason,
+      }),
+    );
+  return projected;
 };
 
 /** Authenticate borrowed inline Evidence after adapter envelope validation. */
@@ -324,39 +332,44 @@ const createAnalysisViewEvidence = (
             ? {}
             : { architecture: parent.subject.architecture }),
         };
-  return createEvidence(target, ANALYSIS_VIEW_PROVIDER, {
-    predicateType: "rea.analysis-view",
-    operation: INSPECT_ANALYSIS_VIEW_OPERATION,
-    parameters: {
-      parent_evidence_id: parent.evidence_id,
-      view: jsonValueSchema.parse(input.view),
+  return createEvidence(
+    target,
+    ANALYSIS_VIEW_PROVIDER,
+    {
+      predicateType: "rea.analysis-view",
+      operation: INSPECT_ANALYSIS_VIEW_OPERATION,
+      parameters: {
+        parent_evidence_id: parent.evidence_id,
+        view: jsonValueSchema.parse(input.view),
+      },
+      result: jsonValueSchema.parse(result),
+      rawResult: null,
+      confidence:
+        // Grouping is whole-capture, so any templated group or parameter makes the result inferred;
+        // entity types and identity in an extracted state always are.
+        result.kind === "environment-state" ||
+        ((result.kind === "api-surface" ||
+          result.kind === "environment-manifest") &&
+          result.templated_groups > 0)
+          ? "inferred"
+          : "derived",
+      authority: parent.authority,
+      limitations: result.limitations,
+      ...(result.kind === "native" && parent.relationship_coverage !== null
+        ? { relationshipCoverage: parent.relationship_coverage }
+        : {}),
+      locations: [
+        ...(result.artifact != null && result.artifact.path.length > 0
+          ? [{ kind: "artifact-path" as const, path: result.artifact.path }]
+          : []),
+        ...(result.kind === "native" &&
+        result.procedure_address !== null &&
+        result.procedure_address.length > 0
+          ? [{ kind: "address" as const, address: result.procedure_address }]
+          : []),
+      ],
+      evidenceLinks: [parent.evidence_id],
     },
-    result: jsonValueSchema.parse(result),
-    rawResult: null,
-    confidence:
-      // Grouping is whole-capture, so any templated group or parameter makes the result inferred;
-      // entity types and identity in an extracted state always are.
-      result.kind === "environment-state" ||
-      ((result.kind === "api-surface" ||
-        result.kind === "environment-manifest") &&
-        result.templated_groups > 0)
-        ? "inferred"
-        : "derived",
-    authority: parent.authority,
-    limitations: result.limitations,
-    ...(result.kind === "native" && parent.relationship_coverage !== null
-      ? { relationshipCoverage: parent.relationship_coverage }
-      : {}),
-    locations: [
-      ...(result.artifact != null && result.artifact.path.length > 0
-        ? [{ kind: "artifact-path" as const, path: result.artifact.path }]
-        : []),
-      ...(result.kind === "native" &&
-      result.procedure_address !== null &&
-      result.procedure_address.length > 0
-        ? [{ kind: "address" as const, address: result.procedure_address }]
-        : []),
-    ],
-    evidenceLinks: [parent.evidence_id],
-  });
+    { immutable: true },
+  );
 };

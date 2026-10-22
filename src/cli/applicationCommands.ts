@@ -14,7 +14,7 @@ import type { Logger } from "pino";
 import { traceApplicationFeatureInputSchema } from "../domain/javascript/javascriptFeatureTraceSchemas.js";
 import { traceJavaScriptSemanticsInputSchema } from "../domain/javascript/javascriptSemanticTraceSchemas.js";
 import { compareApplicationVersionsInputSchema } from "../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
-import { compareSourceToBundleInputSchema } from "../domain/javascript/sourceToBundleComparisonSchemas.js";
+import { registerSourceToBundleCommand } from "./sourceToBundleCommand.js";
 import { compareJavaScriptExportShapesInputSchema } from "../domain/javascript/javascriptExportShapeComparisonSchemas.js";
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import { reconstructionObligationLedgerInputSchema } from "../domain/reconstructionObligationLedgerSchemas.js";
@@ -65,19 +65,7 @@ export const registerApplicationCommands = (
       return compareApplicationVersionsEvidenceValidated(input);
     },
   });
-  registerJsonCommand({
-    cli,
-    logger,
-    name: CLI_COMMANDS.compareSourceToBundle,
-    description:
-      "Compare committed historical source with authenticated application Evidence",
-    inputSchema: compareSourceToBundleInputSchema,
-    workflow: async (input) => {
-      const { compareSourceToBundleEvidenceValidated } =
-        await import("../application/javascript/JavaScriptApplicationWorkflowService.js");
-      return compareSourceToBundleEvidenceValidated(input);
-    },
-  });
+  registerSourceToBundleCommand(cli, logger);
   registerJsonCommand({
     cli,
     logger,
@@ -105,7 +93,7 @@ export const registerApplicationCommands = (
         await import("../application/android/AndroidApplicationService.js");
       const result = projectAndroidApplicationEvidence(input);
       return result.ok
-        ? { ok: true, value: jsonValueSchema.parse(result.value) }
+        ? { ok: true, value: jsonValueSchema.parse(result.value.evidence) }
         : result;
     },
   });
@@ -121,7 +109,7 @@ export const registerApplicationCommands = (
         await import("../application/apple/AppleApplicationService.js");
       const result = projectAppleApplicationEvidence(input);
       return result.ok
-        ? { ok: true, value: jsonValueSchema.parse(result.value) }
+        ? { ok: true, value: jsonValueSchema.parse(result.value.evidence) }
         : result;
     },
   });
@@ -137,7 +125,7 @@ export const registerApplicationCommands = (
         await import("../application/harmony/HarmonyApplicationService.js");
       const result = projectHarmonyApplicationEvidence(input);
       return result.ok
-        ? { ok: true, value: jsonValueSchema.parse(result.value) }
+        ? { ok: true, value: jsonValueSchema.parse(result.value.evidence) }
         : result;
     },
   });

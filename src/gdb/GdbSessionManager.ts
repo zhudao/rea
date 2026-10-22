@@ -1,3 +1,4 @@
+import { snapshotGdbCommandRecords } from "./GdbCommandRecords.js";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { isUtf8 } from "node:buffer";
@@ -35,6 +36,29 @@ import { parseLinuxProcessStat } from "../process/LinuxProcessStat.js";
 
 const STARTUP_TIMEOUT_MS = 10_000;
 const COMMAND_TIMEOUT_MS = 120_000;
+
+/** Fixed debugger deadline. Callers cannot raise it in this release. */
+const fixedDeadlineGuidance = (
+  what: string,
+  timeoutMs: number,
+): { readonly userMessage: string; readonly remediationAction: string } => ({
+  userMessage: `${what} reached its ${String(timeoutMs)} ms deadline (deadlineExpired). This release has no runtime override.`,
+  remediationAction: `This ${String(timeoutMs)} ms deadline has no runtime override. Allow execution, cleanup and delivery headroom in the outer MCP client deadline. Confirm outstanding work and cleanup before retrying.`,
+});
+
+const copiedTimeoutGuidance = (
+  cause: AnalysisTimeoutError,
+): {
+  readonly userMessage?: string;
+  readonly remediationAction?: string;
+} => ({
+  ...(cause.userMessage === undefined
+    ? {}
+    : { userMessage: cause.userMessage }),
+  ...(cause.remediationAction === undefined
+    ? {}
+    : { remediationAction: cause.remediationAction }),
+});
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_RECORDS = 16_384;
 const MAX_MI_LINE_BYTES = 16 * 1024 * 1024;
@@ -96,7 +120,9 @@ class GdbCommandTimeoutError extends AnalysisTimeoutError {
     readonly evidence: Evidence,
     timeoutMs: number,
   ) {
-    super("gdb_console", timeoutMs);
+    super("gdb_console", timeoutMs, {
+      ...fixedDeadlineGuidance("The GDB MI command", timeoutMs),
+    });
   }
 }
 
@@ -646,10 +672,13 @@ export class GdbSessionManager {
         new AnalysisResourceConstraintError(
           "start_gdb_session",
           "memory",
-          "GDB session capacity reached.",
+          `GDB session capacity reached (${String(this.#maxSessions)} sessions). This release has no runtime override.`,
           {
             max_sessions: this.#maxSessions,
             active_or_reserved_sessions: occupied,
+          },
+          {
+            remediationAction: `Close a GDB session before starting another. This capacity of ${String(this.#maxSessions)} sessions has no runtime override.`,
           },
         ),
       );
@@ -836,6 +865,10 @@ export class GdbSessionManager {
                   cause: new Error(
                     "GDB did not emit the MI prompt before the startup deadline",
                   ),
+                  ...fixedDeadlineGuidance(
+                    "GDB startup",
+                    this.#startupTimeoutMs,
+                  ),
                 },
               ),
             ),
@@ -926,16 +959,7 @@ export class GdbSessionManager {
             ? {
                 command: "GDB startup",
                 mi: "",
-                records: [...session.lines],
-                console: session.lines
-                  .filter((line) => line.startsWith("~"))
-                  .join("\n"),
-                target: session.lines
-                  .filter((line) => line.startsWith("@"))
-                  .join("\n"),
-                log: session.lines
-                  .filter((line) => line.startsWith("&"))
-                  .join("\n"),
+                ...snapshotGdbCommandRecords(session.lines),
                 process_exit_observed: true,
                 process_exit_code: session.exitCode,
                 process_exit_signal: session.exitSignal,
@@ -949,16 +973,7 @@ export class GdbSessionManager {
           ? {
               command: "GDB startup",
               mi: "",
-              records: [...session.lines],
-              console: session.lines
-                .filter((line) => line.startsWith("~"))
-                .join("\n"),
-              target: session.lines
-                .filter((line) => line.startsWith("@"))
-                .join("\n"),
-              log: session.lines
-                .filter((line) => line.startsWith("&"))
-                .join("\n"),
+              ...snapshotGdbCommandRecords(session.lines),
               output_truncated: session.recentRecordsTruncated,
               completion_status: "unknown" as const,
             }
@@ -1040,11 +1055,10 @@ export class GdbSessionManager {
         if (cause instanceof AnalysisTimeoutError)
           return err(
             retainCleanup(
-              new AnalysisTimeoutError(
-                cause.operation,
-                cause.timeoutMs,
-                details,
-              ),
+              new AnalysisTimeoutError(cause.operation, cause.timeoutMs, {
+                ...details,
+                ...copiedTimeoutGuidance(cause),
+              }),
             ),
           );
         if (cause instanceof AnalysisCancelledError)
@@ -1079,7 +1093,10 @@ export class GdbSessionManager {
                   ? "start_gdb_session"
                   : cause.operation,
                 cause.timeoutMs,
-                errorDetails,
+                {
+                  ...errorDetails,
+                  ...copiedTimeoutGuidance(cause),
+                },
               )
             : cause instanceof AnalysisCapabilityUnavailableError
               ? new AnalysisCapabilityUnavailableError(
@@ -1192,6 +1209,11 @@ export class GdbSessionManager {
                   "The active GDB inferior identity is not established by the debugger session identifier.",
                 limitations: [
                   "MI records are returned as decoded text; their semantics depend on GDB version and target.",
+                  ...(result.output_truncated
+                    ? [
+                        `Retained MI records reached the ${String(this.#maxCommandOutputBytes)} byte or ${String(MAX_COMMAND_OUTPUT_RECORDS)} record cap. This release has no runtime override. Output completeness is unknown.`,
+                      ]
+                    : []),
                   ...(result.output_invalid_utf8
                     ? [
                         "MI stream bytes were not valid UTF-8; returned text contains replacement characters.",
@@ -1233,7 +1255,7 @@ export class GdbSessionManager {
                     "GDB exited before returning a correlated MI result record; only records retained for the active command are returned raw.",
                     ...(result.output_truncated
                       ? [
-                          "Retained MI records are a truncated prefix; output completeness is unknown.",
+                          `Retained MI records reached the ${String(this.#maxCommandOutputBytes)} byte or ${String(MAX_COMMAND_OUTPUT_RECORDS)} record cap. This release has no runtime override. Output completeness is unknown.`,
                         ]
                       : []),
                   ],
@@ -1254,6 +1276,10 @@ export class GdbSessionManager {
             return err(
               new AnalysisTimeoutError("gdb_console", this.#commandTimeoutMs, {
                 cause,
+                ...fixedDeadlineGuidance(
+                  "The GDB MI command",
+                  this.#commandTimeoutMs,
+                ),
               }),
             );
           }
@@ -1481,10 +1507,13 @@ export class GdbSessionManager {
       throw new AnalysisResourceConstraintError(
         operationName,
         "transport",
-        "GDB command queue capacity reached.",
+        `GDB command queue capacity reached (${String(MAX_PENDING_GDB_COMMANDS)} pending commands). This release has no runtime override.`,
         {
           max_pending_commands: MAX_PENDING_GDB_COMMANDS,
           active_or_queued_commands: session.pendingCommandCount,
+        },
+        {
+          remediationAction: `Wait for a GDB command on this session to finish, then retry. This queue of ${String(MAX_PENDING_GDB_COMMANDS)} commands has no runtime override.`,
         },
       );
     session.pendingCommandCount += 1;
@@ -1539,7 +1568,7 @@ export class GdbSessionManager {
       if (lineBytes > MAX_MI_LINE_BYTES) {
         this.#failProtocol(
           session,
-          "GDB emitted an MI line exceeding the 16 MiB protocol limit.",
+          `GDB emitted an MI line exceeding the ${String(MAX_MI_LINE_BYTES)} byte (16 MiB) protocol limit. This release has no runtime override.`,
         );
         return;
       }
@@ -1595,18 +1624,11 @@ export class GdbSessionManager {
           clearTimeout(pending.timer);
           session.pending.delete(token);
           pending.cleanup();
-          const records = [...pending.lines];
+
           pending.resolve({
             command: "",
             mi: pending.terminalRecord ?? "",
-            records,
-            console: records
-              .filter((record) => record.startsWith("~"))
-              .join("\n"),
-            target: records
-              .filter((record) => record.startsWith("@"))
-              .join("\n"),
-            log: records.filter((record) => record.startsWith("&")).join("\n"),
+            ...snapshotGdbCommandRecords(pending.lines),
             output_truncated: pending.outputTruncated,
             ...(pending.outputInvalidUtf8
               ? { output_invalid_utf8: true as const }
@@ -1631,14 +1653,11 @@ export class GdbSessionManager {
       clearTimeout(pending.timer);
       session.pending.delete(token);
       pending.cleanup();
-      const records = [...pending.lines];
+
       pending.resolve({
         command: "",
         mi: line,
-        records,
-        console: records.filter((record) => record.startsWith("~")).join("\n"),
-        target: records.filter((record) => record.startsWith("@")).join("\n"),
-        log: records.filter((record) => record.startsWith("&")).join("\n"),
+        ...snapshotGdbCommandRecords(pending.lines),
         output_truncated: pending.outputTruncated,
         ...(pending.outputInvalidUtf8
           ? { output_invalid_utf8: true as const }
@@ -1677,15 +1696,12 @@ export class GdbSessionManager {
     for (const pending of session.pending.values()) {
       clearTimeout(pending.timer);
       pending.cleanup();
-      const records = [...pending.lines];
+
       pending.reject(
         new GdbProtocolFailureError(message, {
           command: pending.command,
           mi: "",
-          records,
-          console: records.filter((line) => line.startsWith("~")).join("\n"),
-          target: records.filter((line) => line.startsWith("@")).join("\n"),
-          log: records.filter((line) => line.startsWith("&")).join("\n"),
+          ...snapshotGdbCommandRecords(pending.lines),
           output_truncated: pending.outputTruncated,
           ...(pending.outputInvalidUtf8
             ? { output_invalid_utf8: true as const }
@@ -1869,14 +1885,7 @@ export class GdbSessionManager {
         new GdbCommandProcessExitError({
           command: pending.command,
           mi: "",
-          records: [...pending.lines],
-          console: pending.lines
-            .filter((line) => line.startsWith("~"))
-            .join("\n"),
-          target: pending.lines
-            .filter((line) => line.startsWith("@"))
-            .join("\n"),
-          log: pending.lines.filter((line) => line.startsWith("&")).join("\n"),
+          ...snapshotGdbCommandRecords(pending.lines),
           process_exit_observed: true,
           process_exit_code: code,
           process_exit_signal: signalCode,
@@ -1945,14 +1954,7 @@ export class GdbSessionManager {
         const partial: GdbCommandResult = {
           command: pending.evidenceCommand,
           mi: "",
-          records: [...pending.lines],
-          console: pending.lines
-            .filter((line) => line.startsWith("~"))
-            .join("\n"),
-          target: pending.lines
-            .filter((line) => line.startsWith("@"))
-            .join("\n"),
-          log: pending.lines.filter((line) => line.startsWith("&")).join("\n"),
+          ...snapshotGdbCommandRecords(pending.lines),
           output_truncated: pending.outputTruncated,
           ...(pending.outputInvalidUtf8
             ? { output_invalid_utf8: true as const }
@@ -1962,7 +1964,13 @@ export class GdbSessionManager {
         const timeout = new AnalysisTimeoutError(
           operation,
           this.#commandTimeoutMs,
-          { cause: new Error(`GDB MI command timed out: ${command}`) },
+          {
+            cause: new Error(`GDB MI command timed out: ${command}`),
+            ...fixedDeadlineGuidance(
+              "The GDB MI command",
+              this.#commandTimeoutMs,
+            ),
+          },
         );
         const evidence = createEvidence(undefined, GDB_PROVIDER_IDENTITY, {
           predicateType:
@@ -1979,7 +1987,7 @@ export class GdbSessionManager {
           subjectUnavailableReason:
             "The active GDB inferior identity is not established by the debugger session identifier.",
           limitations: [
-            "The GDB command exceeded its deadline; retained MI and stream records are partial and command completion is unknown.",
+            `The GDB command exceeded its ${String(this.#commandTimeoutMs)} ms deadline (deadlineExpired). This release has no runtime override. Retained MI and stream records are partial and command completion is unknown.`,
             "Cleanup of the owned GDB process was requested because output correlation could no longer be guaranteed.",
             "The unrestricted GDB console can access local shell, filesystem, network, and target controls.",
           ],
@@ -1995,6 +2003,7 @@ export class GdbSessionManager {
                   cause: timeout,
                   cleanup: { reason: stopped.reason, resources: [session.id] },
                   partialObservation: evidence,
+                  ...copiedTimeoutGuidance(timeout),
                 }),
               );
               return;
@@ -2069,14 +2078,7 @@ export class GdbSessionManager {
         const partial: GdbCommandResult = {
           command: pending.evidenceCommand,
           mi: "",
-          records: [...pending.lines],
-          console: pending.lines
-            .filter((line) => line.startsWith("~"))
-            .join("\n"),
-          target: pending.lines
-            .filter((line) => line.startsWith("@"))
-            .join("\n"),
-          log: pending.lines.filter((line) => line.startsWith("&")).join("\n"),
+          ...snapshotGdbCommandRecords(pending.lines),
           output_truncated: pending.outputTruncated,
           ...(pending.outputInvalidUtf8
             ? { output_invalid_utf8: true as const }

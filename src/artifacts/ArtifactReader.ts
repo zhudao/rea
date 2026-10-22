@@ -1,3 +1,4 @@
+import type { ArtifactAdmissionLimit } from "../domain/artifactOperationError.js";
 import type {
   ArtifactIntegrityClaim,
   ArtifactIntegrityDetails,
@@ -28,12 +29,14 @@ export interface ArtifactReaderFailureOptions extends ErrorOptions {
   readonly partialObservation?: AnalysisPartialObservation | undefined;
   /** The constrained resource bound for a limit failure. */
   readonly boundary?: ArtifactReaderBoundary;
+  /** Named admission whose recovery must not be inferred from other limit text. */
+  readonly admission?: ArtifactAdmissionLimit;
 }
 
 /** Archive-neutral entry metadata. Reader adapters never choose output paths. */
 export interface ArtifactEntry {
   readonly path: string;
-  readonly kind: "file" | "directory" | "symlink" | "slice";
+  readonly kind: "file" | "directory" | "symlink" | "slice" | "metadata";
   readonly declaredSize: number | null;
   readonly compressedSize: number | null;
   readonly executable: boolean;
@@ -167,6 +170,7 @@ export interface ArtifactReader {
     | ZipPackageFormat
     | "asar"
     | "godot-pck"
+    | "pyinstaller"
     | "file";
   entries(
     signal?: AbortSignal,
@@ -191,6 +195,8 @@ export class ArtifactReaderFailure extends Error {
   readonly partialObservation: AnalysisPartialObservation | undefined;
   /** The constrained bound for a `limit` reason, when the reader knows it. */
   readonly boundary: ArtifactReaderBoundary | undefined;
+  /** Named admission for a limit whose public recovery is owned by the producer. */
+  readonly admission: ArtifactAdmissionLimit | undefined;
 
   constructor(
     readonly reason:
@@ -216,6 +222,7 @@ export class ArtifactReaderFailure extends Error {
       options?.cleanupLeases ?? (this.cleanup === undefined ? [] : undefined);
     this.partialObservation = options?.partialObservation;
     this.boundary = options?.boundary;
+    this.admission = options?.admission;
   }
 
   /** Preserve the primary failure and observation. Supplied leases must cover all merged cleanup. */
@@ -260,6 +267,9 @@ export class ArtifactReaderFailure extends Error {
         ...(primary.boundary === undefined
           ? {}
           : { boundary: primary.boundary }),
+        ...(primary.admission === undefined
+          ? {}
+          : { admission: primary.admission }),
         ...(mergedObservation === undefined
           ? {}
           : { partialObservation: mergedObservation }),

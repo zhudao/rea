@@ -11,6 +11,10 @@ import { UnknownPlistScalar } from "./unknownPlistScalar.js";
  */
 export const MAX_PLIST_DEPTH = 128;
 
+/** Agent-visible refusal for nesting past the JSON projection allowance. */
+export const plistNestingLimitMessage = (): string =>
+  `Plist exceeds ${String(MAX_PLIST_DEPTH)} nesting levels. This release has no runtime override for this ${String(MAX_PLIST_DEPTH)}-level nesting allowance.`;
+
 /** A decoded plist projected into JSON, with values JSON cannot express. */
 export interface ProjectedPlistValue {
   readonly value: JsonValue;
@@ -27,6 +31,10 @@ export interface ProjectedPlistValue {
 /** Limitation for results whose plist held dates the decoder could not represent. */
 export const unknownDateLimitation = (count: number): string =>
   `${String(count)} date value(s) are reported as { "$plist_type": "date", "iso8601": null } because the decoder could not represent their timestamps.`;
+
+/** Limitation when shared binary bytes prevent safely normalizing date precision. */
+export const binaryDatePrecisionOverlapLimitation = (count: number): string =>
+  `${String(count)} date value(s) are reported with unknown timestamps because their sub-millisecond source records overlap another reachable binary object and the public date projection cannot express their exact instants.`;
 
 /** Limitation for XML scalar literals whose values were not established. */
 export const unknownScalarLimitation = (count: number): string =>
@@ -67,9 +75,7 @@ export const projectPlistValue = (
   };
   const project = (item: unknown, depth: number): JsonValue => {
     if (depth > MAX_PLIST_DEPTH)
-      throw new RangeError(
-        `Plist exceeds ${String(MAX_PLIST_DEPTH)} nesting levels`,
-      );
+      throw new RangeError(plistNestingLimitMessage());
     if (item !== null && typeof item === "object" && types.isProxy(item))
       throw new TypeError("Plist values cannot contain proxies");
     if (item instanceof Uint8Array)

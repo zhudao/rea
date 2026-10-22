@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parse } from "plist";
 
+import { plistNestingLimitMessage } from "./apple/plistValue.js";
 import {
   omitPrototypeKeys,
   parseXmlPropertyList as parseWithNumbers,
@@ -239,7 +240,7 @@ it("rejects XML nesting beyond the projection limit with the limit diagnostic", 
   // `plist` and the prototype-key traversal recurse once per level, so the
   // depth check must report the same bounded-resource error as the projection
   // instead of letting those recursive passes exhaust the call stack.
-  const limit = new RangeError("Plist exceeds 128 nesting levels");
+  const limit = new RangeError(plistNestingLimitMessage());
   expect(() => parseXmlPropertyList(nestedDictionaries(129))).toThrow(limit);
   expect(() => parseXmlPropertyList(nestedArrays(129))).toThrow(limit);
   expect(() => parseXmlPropertyList(nestedDictionaries(3000))).toThrow(limit);
@@ -280,7 +281,7 @@ it.each(['"', "'"])(
       opening.repeat(3000) + "<string>x</string>" + "</dict>".repeat(3000),
     );
     expect(() => parseXmlPropertyList(text)).toThrow(
-      new RangeError("Plist exceeds 128 nesting levels"),
+      new RangeError(plistNestingLimitMessage()),
     );
     expect(
       parseXmlPropertyList(
@@ -308,14 +309,14 @@ it("bounds nested plist wrappers before recursive decoding", () => {
   const text =
     "<plist>".repeat(3000) + "<string>x</string>" + "</plist>".repeat(3000);
   expect(() => parseXmlPropertyList(text)).toThrow(
-    new RangeError("Plist exceeds 128 nesting levels"),
+    new RangeError(plistNestingLimitMessage()),
   );
   expect(
     parseXmlPropertyList(plist("<plist><string>x</string></plist>")).value,
   ).toEqual(["x"]);
 });
 
-it.each(["\n", "\r\n", "\r", "\u0085", "\u2028", "\u2029"])(
+it.each(["\n", "\r\n", "\r"])(
   "preserves unrelated source values around %j line endings",
   (newline) => {
     const text = plist(
@@ -347,7 +348,7 @@ describe("OpenStep plist nesting preflight", () => {
     "rejects %s nested OpenStep values with the shared depth limit",
     (depth) => {
       expect(() => parseXmlPropertyList(arrays(depth))).toThrow(
-        "Plist exceeds 128 nesting levels",
+        plistNestingLimitMessage(),
       );
     },
   );
@@ -390,3 +391,18 @@ describe("OpenStep plist nesting preflight", () => {
     });
   });
 });
+
+it.each(["\u0085", "\u2028", "\u2029"])(
+  "preserves key identity and omission around inter-element separator %j",
+  (separator) => {
+    const parsed = parseXmlPropertyList(
+      plist(
+        `<dict>${separator}<key>kept${separator}key</key><string>a${separator}b</string>${separator}<key>__proto__</key><string>omitted</string></dict>`,
+      ),
+    );
+    expect(parsed).toEqual({
+      value: { [`kept${separator}key`]: `a${separator}b` },
+      omittedPrototypeKeys: 1,
+    });
+  },
+);

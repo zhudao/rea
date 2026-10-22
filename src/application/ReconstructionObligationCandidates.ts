@@ -4,6 +4,7 @@ import canonicalize from "canonicalize";
 
 import type { Evidence } from "../domain/evidence.js";
 import {
+  describeValidationFailure,
   parseEvidenceBundle,
   type EvidenceBundle,
 } from "../domain/evidenceBundle.js";
@@ -113,7 +114,7 @@ const deriveApplicationCandidates = (
         candidates,
         generatedCandidate({
           key: `application:${node.node_id}:${candidatePolicy.family}`,
-          title: node.observations[0]?.label ?? `${node.kind} boundary`,
+          title: node.observations[0]?.label?.trim() || `${node.kind} boundary`,
           policy: candidatePolicy,
           artifactSha256: source.rootArtifactSha256,
           applicationNodeId: node.node_id,
@@ -142,7 +143,7 @@ const deriveApplicationCandidates = (
           candidates,
           generatedCandidate({
             key: `semantic:${node.node_id}:${candidatePolicy.family}`,
-            title: node.label ?? `${node.kind} semantic boundary`,
+            title: node.label?.trim() || `${node.kind} semantic boundary`,
             policy: candidatePolicy,
             artifactSha256: node.identity.artifact_sha256,
             applicationNodeId: node.application_node_ids[0] ?? null,
@@ -166,7 +167,7 @@ const deriveApplicationCandidates = (
       );
   } catch (cause: unknown) {
     limitations.add(
-      `Application Evidence ${evidence.evidence_id} could not generate candidates: ${errorMessage(cause)}`,
+      `Application Evidence ${evidence.evidence_id} could not generate candidates: ${describeValidationFailure(cause)}`,
     );
   }
 };
@@ -258,7 +259,7 @@ const deriveProcessCandidate = (
       );
   } catch (cause: unknown) {
     limitations.add(
-      `Process Evidence ${evidence.evidence_id} could not generate candidates: ${errorMessage(cause)}`,
+      `Process Evidence ${evidence.evidence_id} could not generate candidates: ${describeValidationFailure(cause)}`,
     );
   }
 };
@@ -464,6 +465,3 @@ const digest = (value: unknown): string => {
     throw new TypeError("Reconstruction obligation key is not canonical JSON");
   return createHash("sha256").update(encoded).digest("hex");
 };
-
-const errorMessage = (cause: unknown): string =>
-  cause instanceof Error ? cause.message : "unknown validation failure";

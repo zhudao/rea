@@ -2,6 +2,7 @@ import {
   mkdir,
   readdir,
   readFile,
+  realpath,
   stat,
   symlink,
   writeFile,
@@ -92,7 +93,9 @@ describe("rea environment-export", () => {
         status: "exported",
         directory,
         name: "grafana-example",
-        tool_count: 19,
+        // The served read tools of the state the export derived, as the bundle's server serves them.
+        tool_count: 14,
+        state: { served: true, evidence_id: expect.stringMatching(/^ev_/u) },
         package_source: { kind: "registry" },
       });
       const document = result.json as {
@@ -124,7 +127,19 @@ describe("rea environment-export", () => {
         "utf8",
       );
       expect(dockerfile).toMatch(/^FROM node:24\.18\.0-bookworm-slim\n/u);
-      expect(dockerfile).toContain('CMD ["rea","environment-serve"');
+      expect(dockerfile).toContain(
+        'CMD ["rea","environment-serve","/env/manifest.json","--evidence","/env/evidence.json"]',
+      );
+      const verifier = await readFile(
+        join(directory, "artifacts/check_grafana-example/verify.py"),
+        "utf8",
+      );
+      expect(verifier).toContain("TOOL_COUNT = 14\n");
+      expect(verifier).toContain('TOOL = "get_annotations"\n');
+      expect(verifier).toContain("EXPECTED_STATUS = 200\n");
+      expect(await readFile(join(directory, "README.md"), "utf8")).toContain(
+        "This bundle serves from the state",
+      );
     },
   );
 
@@ -283,5 +298,59 @@ cliTest.skipIf(process.platform === "win32")(
     await expect(
       readFile(join(root, "bundle/README.md")),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  },
+);
+
+const HOST_PATH_MAX: Partial<Record<NodeJS.Platform, number>> = {
+  darwin: 1024,
+  linux: 4096,
+};
+
+cliTest.skipIf(HOST_PATH_MAX[process.platform] === undefined)(
+  "reports a later nested-file pathname-limit failure as a host write failure and keeps the partial folder",
+  async ({ cli }) => {
+    const limit = HOST_PATH_MAX[process.platform] ?? 0;
+    const root = await realpath(
+      await createTestTempDirectory("rea-export-long-path-"),
+    );
+    const files = await writeEnvironmentServeFiles(root);
+    // Shorter bundle paths fit; the 41-byte nested verifier path reaches the host limit.
+    const length = limit - 40;
+    let parent = join(root, "long");
+    while (Buffer.byteLength(parent) + 1 + 200 < length - 1)
+      parent = join(parent, "d".repeat(200));
+    await mkdir(parent, { recursive: true });
+    const directory = join(
+      parent,
+      "l".repeat(length - Buffer.byteLength(parent) - 1),
+    );
+    expect(Buffer.byteLength(directory)).toBe(length);
+    const failed = join(directory, "artifacts/check_grafana-example/verify.py");
+    const result = await cli.run({
+      arguments: [
+        "environment-export",
+        files.manifestPath,
+        "--evidence",
+        files.capturePath,
+        directory,
+        "--json",
+      ],
+      timeoutMs: 30_000,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.json).toMatchObject({
+      code: "unreadable_output",
+      remediation: { action: expect.stringContaining(directory) },
+      details: {
+        operation: "environment-export",
+        diagnostics: { output_directory: directory },
+      },
+    });
+    expect(result.json).not.toHaveProperty("details.issues");
+    const reason = (result.json as { details: { reason: string } }).details
+      .reason;
+    expect(reason).toContain("ENAMETOOLONG");
+    expect(reason).toContain(failed);
+    expect(await readFile(join(directory, "README.md"))).not.toHaveLength(0);
   },
 );

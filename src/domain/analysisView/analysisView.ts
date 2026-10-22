@@ -1,7 +1,21 @@
 import {
+  sourceToBundleViewRequestSchema,
+  sourceToBundleViewItemsSchema,
+  sourceToBundleViewContextSchema,
+  projectSourceToBundleView,
+} from "./sourceToBundleView.js";
+import {
+  gpuCodeObjectsViewRequestSchema,
+  gpuCodeObjectsSummarySchema,
+  gpuCodeObjectsItemsSchema,
+  gpuCodeObjectsPtxPageSchema,
+  projectGpuCodeObjectsView,
+} from "./gpuCodeObjectsView.js";
+import { gpuCodeObjectsObjectSchema } from "../gpu/gpuCodeObjects.js";
+import { modelArtifactViewRequestSchema } from "../model/modelArtifactQuery.js";
+import {
   projectModelArtifactView,
   modelArtifactSummarySchema,
-  modelArtifactViewRequestSchema,
   modelArtifactViewItemsSchema,
   modelArtifactViewContextSchema,
 } from "./modelArtifactView.js";
@@ -17,12 +31,21 @@ import {
 } from "./fridaSessionStatusView.js";
 import { commandObservationSchema } from "../commandObservation.js";
 import {
+  rustBinaryViewPageSchema,
+  rustBinaryViewRequestSchema,
+} from "../rust/rustBinaryQuery.js";
+import {
   goBinarySummarySchema,
   goBinaryViewContextSchema,
   goBinaryViewPageSchema,
   goBinaryViewRequestSchema,
   projectGoBinaryView,
 } from "./goBinaryView.js";
+import {
+  rustBinarySummarySchema,
+  rustBinaryViewContextSchema,
+  projectRustBinaryView,
+} from "./rustBinaryView.js";
 import {
   projectNativeFunctionMatchingView,
   nativeFunctionMatchingViewRequestSchema,
@@ -275,8 +298,10 @@ const nativeViewSchema = z.strictObject({
 /** Caller-selected projection of already completed analysis Evidence. */
 export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
   nativeFunctionMatchingViewRequestSchema,
+  sourceToBundleViewRequestSchema,
   summaryViewSchema,
   goBinaryViewRequestSchema,
+  rustBinaryViewRequestSchema,
   desktopViewRequestSchema,
   facetViewSchema,
   itemViewSchema,
@@ -303,6 +328,7 @@ export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
   dartAotViewRequestSchema,
   il2cppMetadataViewRequestSchema,
   modelArtifactViewRequestSchema,
+  gpuCodeObjectsViewRequestSchema,
 ]);
 
 // The application owns admission and authenticated Evidence parsing. SDK and
@@ -412,6 +438,7 @@ const viewResultBase = {
     "inspect_dart_aot",
     "inspect_il2cpp_metadata",
     "inspect_model_artifact",
+    "inspect_gpu_code_objects",
     ...NATIVE_INVENTORY_OPERATIONS,
     "match_native_functions",
   ]),
@@ -460,6 +487,24 @@ export const goBinarySummaryViewResultSchema = z.strictObject({
   ...goBinaryViewContextSchema.shape,
   parent_operation: z.literal("inspect_go_binary"),
   summary: goBinarySummarySchema,
+});
+
+/** Compact source identity and counts, retaining the complete embedded graph. */
+export const rustBinarySummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  ...rustBinaryViewContextSchema.shape,
+  parent_operation: z.literal("inspect_rust_binary"),
+  summary: rustBinarySummarySchema,
+});
+
+export const rustBinaryPageViewResultSchema = z.strictObject({
+  ...viewResultBase,
+  ...rustBinaryViewContextSchema.shape,
+  kind: z.literal("rust"),
+  parent_operation: z.literal("inspect_rust_binary"),
+  view: rustBinaryViewRequestSchema,
+  rust: rustBinarySummarySchema,
+  page: rustBinaryViewPageSchema,
 });
 
 /** Summary `inspect_binary_layout` detail returns; no other view kind. */
@@ -579,6 +624,21 @@ export const dartAotSummaryViewResultSchema = z.strictObject({
   summary: dartAotSummarySchema,
 });
 
+export const gpuCodeObjectsSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_gpu_code_objects"),
+  summary: gpuCodeObjectsSummarySchema,
+});
+export const gpuCodeObjectsPageViewResultSchema = z.strictObject({
+  kind: z.literal("gpu-code-objects"),
+  view: gpuCodeObjectsViewRequestSchema,
+  items: gpuCodeObjectsItemsSchema,
+  ptx: gpuCodeObjectsPtxPageSchema.nullable(),
+  source_coverage: gpuCodeObjectsObjectSchema.shape.coverage,
+  ...viewResultBase,
+  parent_operation: z.literal("inspect_gpu_code_objects"),
+});
+
 export const modelArtifactSummaryViewResultSchema = z.strictObject({
   ...summaryViewResultBase,
   parent_operation: z.literal("inspect_model_artifact"),
@@ -618,8 +678,25 @@ export const nativeFunctionMatchingSummaryViewResultSchema = z.strictObject({
   summary: nativeFunctionMatchingViewContextSchema,
 });
 
+export const sourceToBundleSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  artifact: z.null(),
+  parent_operation: z.literal("compare_source_to_bundle"),
+  summary: sourceToBundleViewContextSchema,
+});
+export const sourceToBundlePageViewResultSchema = z.strictObject({
+  ...viewResultBase,
+  ...sourceToBundleViewContextSchema.shape,
+  kind: z.literal("source-to-bundle"),
+  artifact: z.null(),
+  parent_operation: z.literal("compare_source_to_bundle"),
+  view: sourceToBundleViewRequestSchema,
+  items: sourceToBundleViewItemsSchema,
+});
+
 /** Projected facts for one selected view of retained analysis Evidence. */
 export const analysisViewResultSchema = z.discriminatedUnion("kind", [
+  sourceToBundlePageViewResultSchema,
   z.strictObject({
     ...viewResultBase,
     ...nativeFunctionMatchingViewContextSchema.shape,
@@ -665,6 +742,7 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     objdumpSummaryViewResultSchema,
     fridaSessionStatusSummaryViewResultSchema,
     goBinarySummaryViewResultSchema,
+    rustBinarySummaryViewResultSchema,
     binaryLayoutSummaryViewResultSchema,
     desktopApplicationSummaryViewResultSchema,
     javascriptApplicationSummaryViewResultSchema,
@@ -681,8 +759,10 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     dartAotSummaryViewResultSchema,
     il2cppMetadataSummaryViewResultSchema,
     modelArtifactSummaryViewResultSchema,
+    gpuCodeObjectsSummaryViewResultSchema,
     nativeInventorySummaryViewResultSchema,
     nativeFunctionMatchingSummaryViewResultSchema,
+    sourceToBundleSummaryViewResultSchema,
   ]),
   z.strictObject({
     ...viewResultBase,
@@ -738,6 +818,7 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     view: goBinaryViewRequestSchema,
     page: goBinaryViewPageSchema,
   }),
+  rustBinaryPageViewResultSchema,
   z.strictObject({
     kind: z.literal("item"),
     view: itemViewSchema,
@@ -829,6 +910,7 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     parent_operation: z.literal("inspect_dart_aot"),
   }),
   modelArtifactPageViewResultSchema,
+  gpuCodeObjectsPageViewResultSchema,
   z.strictObject({
     kind: z.literal("il2cpp-metadata"),
     view: il2cppMetadataViewRequestSchema,
@@ -954,6 +1036,7 @@ const retainedViewProjectors = new Map<string, typeof projectWasmArtifactView>([
   ["gdb_console", projectCommandObservationView],
   ["inspect_with_objdump", projectCommandObservationView],
   ["inspect_go_binary", projectGoBinaryView],
+  ["inspect_rust_binary", projectRustBinaryView],
   ...NATIVE_INVENTORY_OPERATIONS.map(
     (operation) => [operation, projectNativeInventoryView] as const,
   ),
@@ -968,7 +1051,9 @@ const retainedViewProjectors = new Map<string, typeof projectWasmArtifactView>([
   ["inspect_dart_aot", projectDartAotView],
   ["inspect_il2cpp_metadata", projectIl2cppMetadataView],
   ["inspect_model_artifact", projectModelArtifactView],
+  ["inspect_gpu_code_objects", projectGpuCodeObjectsView],
   ["match_native_functions", projectNativeFunctionMatchingView],
+  ["compare_source_to_bundle", projectSourceToBundleView],
   ["inspect_artifact", projectArtifactInventoryView],
   ["inventory_artifact", projectArtifactInventoryView],
 ]);

@@ -69,7 +69,7 @@ export const observeCdpSession = async (
   const capture = new TimelineCapture(allowedOrigins, mainFrameId, initialUrl);
   let removeListener = (): void => {};
   const removeDisconnectListener = context.connection.onDisconnect(() =>
-    capture.targetTerminated(),
+    capture.transportDisconnected(),
   );
   try {
     await context.connection.send(
@@ -123,6 +123,7 @@ export const observeCdpSession = async (
     let endReason = await waitForWindow(
       context.input.observation_ms,
       capture,
+      context.connection,
       context.signal,
     );
     if (endReason === "window_elapsed")
@@ -236,8 +237,10 @@ class TimelineCapture {
         this.#lifecycle(params);
         break;
       case "Inspector.targetCrashed":
-      case "Target.detachedFromTarget":
         this.targetTerminated(params);
+        break;
+      case "Target.detachedFromTarget":
+        this.sessionDetached(params);
         break;
     }
   }
@@ -304,6 +307,32 @@ class TimelineCapture {
       detail: "target_terminated",
     });
     this.end("target_terminated");
+  }
+
+  sessionDetached(params: UnknownRecord = {}): void {
+    if (this.#endReason !== undefined) return;
+    this.#add({
+      type: "session_detached",
+      params,
+      timestamp: null,
+      rawUrl: null,
+      requestId: null,
+      detail: "session_detached",
+    });
+    this.end("session_detached");
+  }
+
+  transportDisconnected(): void {
+    if (this.#endReason !== undefined) return;
+    this.#add({
+      type: "transport_disconnected",
+      params: {},
+      timestamp: null,
+      rawUrl: null,
+      requestId: null,
+      detail: "transport_disconnected",
+    });
+    this.end("transport_disconnected");
   }
 
   setFinalUrl(rawUrl: string): void {
@@ -565,18 +594,21 @@ const performanceTimestamp = (value: unknown): number => {
 const waitForWindow = async (
   durationMs: number,
   capture: TimelineCapture,
+  connection: CdpConnection,
   signal?: AbortSignal,
 ): Promise<EndReason> =>
   await new Promise<EndReason>((resolve, reject) => {
     const timerController = new AbortController();
     let settled = false;
     let removeEnd = (): void => {};
+    let removeProtocolFailure = (): void => {};
     const settle = (complete: () => void): void => {
       if (settled) return;
       settled = true;
       timerController.abort();
       signal?.removeEventListener("abort", onAbort);
       removeEnd();
+      removeProtocolFailure();
       complete();
     };
     const finish = (reason: EndReason): void => settle(() => resolve(reason));
@@ -591,6 +623,10 @@ const waitForWindow = async (
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted === true) onAbort();
     if (!settled) removeEnd = capture.onEnd(finish);
+    if (!settled)
+      removeProtocolFailure = connection.onProtocolFailure((error) =>
+        settle(() => reject(error)),
+      );
     if (settled) return;
     void delayWithCancellation(
       durationMs,

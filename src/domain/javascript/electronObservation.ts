@@ -1,9 +1,14 @@
 import { z } from "zod";
 
+import { webRuntimeCommandTimeoutSchema } from "../browserDeadline.js";
 import { browserCompletenessSchema } from "../browserCompleteness.js";
 import { browserEndpointSchema } from "../browserObservation.js";
 import { browserVersionSchema } from "../browserObservationSchemas.js";
-import { webTextArtifactSchema } from "../webContentArtifact.js";
+import {
+  cdpDomNodeSchema,
+  cdpScriptSourceSchema,
+  cdpScriptMetadataSchema,
+} from "../cdpObservationSchemas.js";
 import { prefixedDigestSchema } from "../digests.js";
 
 const approvedElectronInput = {
@@ -23,6 +28,7 @@ const inspectElectronPageFacts = {
   ...approvedElectronInput,
   target_id: z.string().trim().min(1),
   observation_ms: z.number().int().min(0).default(100),
+  command_timeout_ms: webRuntimeCommandTimeoutSchema,
 } as const;
 export const inspectElectronPageInputSchema = z.union([
   z.strictObject({
@@ -63,11 +69,6 @@ export const electronTargetListSchema = z.object({
 });
 export type ElectronTargetList = z.infer<typeof electronTargetListSchema>;
 
-const electronSourceSchema = z.discriminatedUnion("included", [
-  z.object({ included: z.literal(false), reason: z.string() }),
-  z.object({ included: z.literal(true), artifact: webTextArtifactSchema }),
-]);
-
 /** Provider-neutral passive Electron file-page structure and script inventory. */
 export const electronPageInspectionSchema = z.object({
   browser: browserVersionSchema,
@@ -87,16 +88,7 @@ export const electronPageInspectionSchema = z.object({
   ),
   dom: z.object({
     total_nodes: z.number().int().min(0),
-    nodes: z.array(
-      z.object({
-        index: z.number().int().min(0),
-        parent_index: z.number().int().min(-1),
-        node_type: z.number().int().min(0),
-        node_name: z.string(),
-        node_value_length: z.number().int().min(0),
-        attribute_names: z.array(z.string()),
-      }),
-    ),
+    nodes: z.array(cdpDomNodeSchema),
   }),
   scripts: z.object({
     total: z.number().int().min(0),
@@ -105,24 +97,8 @@ export const electronPageInspectionSchema = z.object({
         script_key: prefixedDigestSchema("electron_script"),
         frame_id: z.string().nullable().default(null),
         file_path: z.string(),
-        cdp_hash: z
-          .string()
-          .nullable()
-          .describe("Producer-reported script hash; null when unavailable."),
-        length: z
-          .number()
-          .int()
-          .min(0)
-          .nullable()
-          .describe("Producer-reported script length; null when unavailable."),
-        is_module: z
-          .boolean()
-          .nullable()
-          .describe(
-            "Producer-reported module classification; null when unavailable.",
-          ),
-        language: z.string().nullable(),
-        source: electronSourceSchema,
+        ...cdpScriptMetadataSchema.shape,
+        source: cdpScriptSourceSchema,
       }),
     ),
   }),
