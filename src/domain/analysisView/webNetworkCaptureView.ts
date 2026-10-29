@@ -3,7 +3,7 @@ import { analysisViewInputError } from "./analysisViewErrors.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { AnalysisError } from "../analysisErrorBase.js";
-import { analysisInputErrorFromIssues } from "../inputIssueProjection.js";
+import { parseAnalysisViewResult } from "./analysisViewParent.js";
 import type { JsonValue } from "../jsonValue.js";
 import { err, ok, type Result } from "../result.js";
 import {
@@ -36,8 +36,8 @@ import {
 export const captureViewRequestSchema = z.strictObject({
   kind: z.literal("capture"),
   detail: z.enum(["preview", "complete"]).default("preview"),
-  offset: z.number().int().nonnegative().default(0),
-  limit: z.number().int().positive().default(64),
+  offset: z.int().nonnegative().default(0),
+  limit: z.int().positive().default(64),
 });
 
 const protobufSummarySchema = z.strictObject({
@@ -73,8 +73,8 @@ export const captureSummarySchema = z.strictObject({
   artifact: webNetworkCaptureArtifactSchema,
   decoder: webNetworkCaptureDecoderSchema,
   format: z.enum(WEB_NETWORK_CAPTURE_FORMATS),
-  total_records: z.number().int().nonnegative(),
-  retained_records: z.number().int().nonnegative(),
+  total_records: z.int().nonnegative(),
+  retained_records: z.int().nonnegative(),
   runtime_attribution: z.literal("unknown"),
   protobuf: protobufSummarySchema.exactOptional(),
   qlog: qlogSummarySchema.optional(),
@@ -87,15 +87,32 @@ const object = (
     ? value
     : null;
 
-const HEADLINE_FIELDS = [
-  "method",
-  "url",
-  "httpVersion",
-  "http_version",
-  "status",
-  "statusText",
-  "reason",
-];
+// Field names have different meanings across producers. In particular, HAR
+// entry extensions named `name` or `type` are not qlog or mitmproxy headlines.
+const RECORD_HEADLINES: Readonly<Record<string, readonly string[]>> = {
+  har: ["time", "startedDateTime"],
+  qlog: ["name", "time"],
+  saz: ["session_id", "time"],
+  mitmproxy: ["type"],
+};
+const HTTP_HEADLINES: Readonly<
+  Record<string, Readonly<Record<string, readonly string[]>>>
+> = {
+  har: {
+    request: ["method", "url", "httpVersion"],
+    response: ["httpVersion", "status", "statusText"],
+  },
+  saz: {
+    request: ["method", "url", "http_version"],
+    response: ["http_version", "status", "reason"],
+  },
+  mitmproxy: {
+    request: ["method", "http_version"],
+    response: ["http_version", "reason"],
+  },
+};
+const scalar = (value: JsonValue): boolean =>
+  value === null || typeof value !== "object";
 // Native mitmproxy flows report the request target in parts and the status
 // as status_code. They are previewed only for mitmproxy records and only when
 // each value has its field's well-formed shape, which also bounds the
@@ -334,12 +351,15 @@ const mitmproxyHeadline = (
 const selectHeadlines = (
   fields: Readonly<Record<string, JsonValue>>,
   key: string,
+  format: string,
   facets: FacetIndex | null,
   selectedPointers: Set<string>,
 ): Record<string, JsonValue> => {
   const selected: Record<string, JsonValue> = {};
   const candidates = [
-    ...HEADLINE_FIELDS.map((field) => [field, null] as const),
+    ...(HTTP_HEADLINES[format]?.[key] ?? []).map(
+      (field) => [field, null] as const,
+    ),
     ...(facets === null ? [] : (MITMPROXY_HEADLINE_FIELDS[key] ?? [])).map(
       (field) => [field, facets] as const,
     ),
@@ -349,6 +369,7 @@ const selectHeadlines = (
     if (
       !Object.hasOwn(fields, field) ||
       value === undefined ||
+      !scalar(value) ||
       (index !== null &&
         !mitmproxyHeadline(index, `/${key}/${field}`, field, value))
     )
@@ -371,12 +392,16 @@ const preview = (record: WebNetworkCaptureRecord, format: string) => {
         : null;
     const mitmproxyFacets =
       index !== null && textualFlowType(index) ? index : null;
-    for (const key of ["session_id", "name", "time", "startedDateTime", "type"])
-      if (Object.hasOwn(source, key) && source[key] !== undefined) {
+    for (const key of RECORD_HEADLINES[format] ?? [])
+      if (
+        Object.hasOwn(source, key) &&
+        source[key] !== undefined &&
+        scalar(source[key])
+      ) {
         reported[key] = source[key];
         selectedPointers.add(`/${key}`);
       }
-    for (const key of ["request", "response"]) {
+    for (const key of Object.keys(HTTP_HEADLINES[format] ?? {})) {
       const value = source[key];
       if (!Object.hasOwn(source, key) || value === undefined) continue;
       const fields = object(value);
@@ -388,6 +413,7 @@ const preview = (record: WebNetworkCaptureRecord, format: string) => {
       reported[key] = selectHeadlines(
         fields,
         key,
+        format,
         mitmproxyFacets,
         selectedPointers,
       );
@@ -413,38 +439,26 @@ const preview = (record: WebNetworkCaptureRecord, format: string) => {
   };
 };
 
+const captureParser = { safeParse: safeParseOwnedWebNetworkCapture };
+
 /** Authenticate the retained report and its subject at one owning boundary. */
 const parseCaptureParent = (
   parent: AnalysisViewParent,
 ): Result<WebNetworkCapture, AnalysisError> => {
-  const parsed = safeParseOwnedWebNetworkCapture(parent.normalizedResult);
-
-  if (!parsed.success)
-    return err(
-      analysisInputErrorFromIssues(
-        "inspect_analysis_view",
-        parsed.error.issues.map((issue) => ({
-          ...issue,
-          path: ["source", "normalized_result", ...issue.path],
-        })),
-        { source: { normalized_result: parent.normalizedResult } },
-        { cause: parsed.error },
-      ),
-    );
-  const report = parsed.data;
+  const parsed = parseAnalysisViewResult(captureParser, parent);
+  if (!parsed.ok) return parsed;
+  const report = parsed.value;
+  const subject = parent.subject;
   if (
     report.artifact.sha256 !== null &&
-    (parent.subject == null ||
-      parent.subject.local_path !== report.artifact.path ||
-      parent.subject.digest.sha256 !== report.artifact.sha256)
+    (subject == null || subject.digest.sha256 !== report.artifact.sha256)
   )
     return err(
       analysisViewInputError([
         {
           path: ["source", "subject"],
           reason: "invalid_value",
-          message:
-            "Capture parent subject must identify the report's exact path and SHA-256.",
+          message: "Capture parent subject must identify the report's SHA-256.",
         },
       ]),
     );
@@ -468,7 +482,7 @@ export const projectWebNetworkCaptureView = (
           path: ["view"],
           reason: "invalid_value",
           message:
-            "Historical captures support summary, capture record pages, qlog fact pages and admitted api-surface, environment-manifest or environment-state views.",
+            "Historical captures support summary, capture record pages, qlog fact pages and admitted api-surface, environment-manifest, environment-state or environment-coverage views.",
         },
       ]),
     );

@@ -1,4 +1,7 @@
-import type { ArtifactAdmissionLimit } from "../domain/artifactOperationError.js";
+import type {
+  ArtifactAdmissionLimit,
+  ArtifactLimitBoundary,
+} from "../domain/artifactOperationError.js";
 import type {
   ArtifactIntegrityClaim,
   ArtifactIntegrityDetails,
@@ -18,17 +21,16 @@ import type {
   AnalysisPartialObservation,
 } from "../domain/analysisErrorBase.js";
 
-/** Which bound a `limit` failure hit, so callers need not infer it. */
-export type ArtifactReaderBoundary = "file-size" | "capacity" | "memory";
-
 export interface ArtifactReaderFailureOptions extends ErrorOptions {
+  /** Recovery guidance established by the producing adapter, separate from diagnostics. */
+  readonly userMessage?: string | undefined;
   readonly cancellation?: { readonly reason: unknown } | undefined;
   readonly cleanup?: AnalysisCleanupObservation | undefined;
   /** Exact authority for all reported cleanup; undefined leaves ownership unknown. */
   readonly cleanupLeases?: readonly AnalysisCleanupLease[] | undefined;
   readonly partialObservation?: AnalysisPartialObservation | undefined;
   /** The constrained resource bound for a limit failure. */
-  readonly boundary?: ArtifactReaderBoundary;
+  readonly boundary?: ArtifactLimitBoundary;
   /** Named admission whose recovery must not be inferred from other limit text. */
   readonly admission?: ArtifactAdmissionLimit;
 }
@@ -36,6 +38,8 @@ export interface ArtifactReaderFailureOptions extends ErrorOptions {
 /** Archive-neutral entry metadata. Reader adapters never choose output paths. */
 export interface ArtifactEntry {
   readonly path: string;
+  /** Exact reader-source path or opaque key before logical path mapping. */
+  readonly sourcePath?: string;
   readonly kind: "file" | "directory" | "symlink" | "slice" | "metadata";
   readonly declaredSize: number | null;
   readonly compressedSize: number | null;
@@ -86,7 +90,7 @@ export const copyArtifactEntry = (entry: ArtifactEntry): ArtifactEntry => ({
     entry.declaredIntegrity === null ? null : { ...entry.declaredIntegrity },
   ...(entry.formatMetadata === undefined
     ? {}
-    : { formatMetadata: { ...entry.formatMetadata } }),
+    : { formatMetadata: structuredClone(entry.formatMetadata) }),
   ...(entry.sourceIdentity === undefined
     ? {}
     : { sourceIdentity: { ...entry.sourceIdentity } }),
@@ -98,6 +102,7 @@ export const sameArtifactEntry = (
   produced: ArtifactEntry,
 ): boolean =>
   entry.path === produced.path &&
+  entry.sourcePath === produced.sourcePath &&
   entry.kind === produced.kind &&
   entry.declaredSize === produced.declaredSize &&
   entry.compressedSize === produced.compressedSize &&
@@ -131,19 +136,32 @@ const sameDeclaredIntegrity = (
     left.algorithm === right.algorithm &&
     left.digest === right.digest);
 
-/** Format metadata contracts contain only primitive source fields. */
-const sameFormatMetadata = (
-  left: ArtifactFormatMetadata | undefined,
-  right: ArtifactFormatMetadata | undefined,
-): boolean =>
-  left === right ||
-  (left !== undefined &&
-    right !== undefined &&
+/** Compare cloned JSON facts structurally while retaining the primitive fast path. */
+const sameFormatMetadata = (left: unknown, right: unknown): boolean => {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right))
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameFormatMetadata(value, right[index]))
+    );
+  if (
+    left === null ||
+    right === null ||
+    typeof left !== "object" ||
+    typeof right !== "object"
+  )
+    return false;
+  return (
     Object.keys(left).length === Object.keys(right).length &&
     Object.entries(left).every(
       ([key, value]) =>
-        Object.hasOwn(right, key) && Reflect.get(right, key) === value,
-    ));
+        Object.hasOwn(right, key) &&
+        sameFormatMetadata(value, Reflect.get(right, key)),
+    )
+  );
+};
 
 /** One entry or subtree deliberately excluded from a traversal. */
 export interface ArtifactTraversalOmission {
@@ -155,6 +173,8 @@ export interface ArtifactTraversalOmission {
 export interface ArtifactReaderTraversal {
   readonly status: ArtifactInventoryCoverage["status"];
   readonly limitations: readonly string[];
+  /** Number of directory entries examined, including names omitted before decoding. */
+  readonly examinedEntries?: number;
 }
 
 /** Per-iterator observation sink; adapters report intentional omissions without shared state. */
@@ -170,7 +190,14 @@ export interface ArtifactReader {
     | ZipPackageFormat
     | "asar"
     | "godot-pck"
+    | "unityfs"
+    | "uimage"
     | "pyinstaller"
+    | "node-sea"
+    | "intel-hex"
+    | "srec"
+    | "esp-image"
+    | "fit"
     | "file";
   entries(
     signal?: AbortSignal,
@@ -189,12 +216,13 @@ export interface ArtifactReader {
 
 /** Typed adapter failure translated at provider boundary. */
 export class ArtifactReaderFailure extends Error {
+  readonly userMessage: string | undefined;
   readonly cancellation: { readonly reason: unknown } | undefined;
   readonly cleanup: AnalysisCleanupObservation | undefined;
   readonly cleanupLeases: readonly AnalysisCleanupLease[] | undefined;
-  readonly partialObservation: AnalysisPartialObservation | undefined;
+  partialObservation: AnalysisPartialObservation | undefined;
   /** The constrained bound for a `limit` reason, when the reader knows it. */
-  readonly boundary: ArtifactReaderBoundary | undefined;
+  readonly boundary: ArtifactLimitBoundary | undefined;
   /** Named admission for a limit whose public recovery is owned by the producer. */
   readonly admission: ArtifactAdmissionLimit | undefined;
 
@@ -213,6 +241,7 @@ export class ArtifactReaderFailure extends Error {
   ) {
     super(message, options);
     this.name = "ArtifactReaderFailure";
+    this.userMessage = options?.userMessage;
     this.cancellation =
       reason === "cancelled"
         ? (options?.cancellation ?? { reason: options?.cause })
@@ -223,6 +252,12 @@ export class ArtifactReaderFailure extends Error {
     this.partialObservation = options?.partialObservation;
     this.boundary = options?.boundary;
     this.admission = options?.admission;
+  }
+
+  /** Retain completed facts when a later artifact step fails. */
+  retainPartialObservation(observation: AnalysisPartialObservation): this {
+    this.partialObservation ??= observation;
+    return this;
   }
 
   /** Preserve the primary failure and observation. Supplied leases must cover all merged cleanup. */
@@ -257,6 +292,7 @@ export class ArtifactReaderFailure extends Error {
       primary.message,
       {
         cause: primary,
+        userMessage: primary.userMessage,
         cancellation: primary.cancellation,
         cleanup: combineCleanup(primary.cleanup, cleanup),
         cleanupLeases:
@@ -320,3 +356,17 @@ export const artifactPrimaryCleanupLeases = (
     : cause instanceof AnalysisError && cause.cleanupIncomplete
       ? undefined
       : [];
+
+/** Known member identities whose content cannot be read; never a reader shutdown. */
+export class ArtifactEntryContentUnavailable extends ArtifactReaderFailure {
+  readonly traversal: ArtifactReaderTraversal | undefined;
+  constructor(
+    message: string,
+    readonly limitation: string,
+    options?: ErrorOptions & { readonly traversal?: ArtifactReaderTraversal },
+    details?: ArtifactIntegrityDetails,
+  ) {
+    super("unavailable", message, options, details);
+    this.traversal = options?.traversal;
+  }
+}

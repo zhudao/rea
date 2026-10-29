@@ -18,7 +18,6 @@ import type {
 } from "../../domain/javascript/javascriptSemanticIr.js";
 import { sourceRangesEqual as rangesEqual } from "../../domain/javascript/javascriptStaticAnalysisHelpers.js";
 import type { JavaScriptApplicationGraph } from "../../domain/javascript/javascriptApplicationGraph.js";
-import type { JavaScriptArtifactAnalysis } from "./JavaScriptArtifactAnalysisTypes.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
 import {
   projectSemanticEvents,
@@ -31,6 +30,7 @@ import {
   projectSemanticRequests,
 } from "./JavaScriptSemanticGraphDataProjection.js";
 import { projectSemanticResources } from "./JavaScriptSemanticGraphResourceProjection.js";
+import { projectSemanticAssignments } from "./JavaScriptSemanticGraphAssignmentProjection.js";
 import { projectSemanticObjects } from "./JavaScriptSemanticGraphObjectProjection.js";
 import { projectSemanticValues } from "./JavaScriptSemanticGraphValueProjection.js";
 import {
@@ -51,6 +51,7 @@ import {
 import type { JsonValue } from "../../domain/jsonValue.js";
 import {
   JAVASCRIPT_ANALYSIS_RESOURCE_DEFAULTS,
+  JAVASCRIPT_ANALYSIS_TRANSFER_RECORD_BYTES,
   JAVASCRIPT_SEMANTIC_ITEM_MAXIMUM,
   javaScriptAnalysisCoverageLimits,
   javaScriptSemanticCeilingCoverage,
@@ -71,6 +72,7 @@ import {
   semanticFamilyStatus,
 } from "./JavaScriptSemanticGraphProjection.js";
 import {
+  constructSemanticGraphNode,
   addSemanticFallbackRoot as addFallbackRoot,
   addSemanticGraphUnknown,
   recordSemanticUnknownOmission,
@@ -87,14 +89,7 @@ import type {
 import type { ElectronCallPath } from "../../domain/javascript/electronStaticAnalysisTypes.js";
 import { projectElectronSemanticCallPaths } from "./JavaScriptSemanticGraphElectronProjection.js";
 
-interface BuilderInput {
-  readonly rootArtifactSha256: string;
-  readonly applicationGraph: Pick<
-    JavaScriptApplicationGraph,
-    "graph_id" | "nodes"
-  >;
-  readonly analysis: JavaScriptArtifactAnalysis;
-}
+type ApplicationGraph = Pick<JavaScriptApplicationGraph, "graph_id" | "nodes">;
 
 interface FileContext extends SemanticFlowProjectionContext {
   readonly file: JavaScriptArtifactFile;
@@ -143,33 +138,6 @@ export const SEMANTIC_GRAPH_NODE_CEILING =
 export const SEMANTIC_GRAPH_FILE_NODE_CEILING =
   JAVASCRIPT_ANALYSIS_RESOURCE_DEFAULTS.semanticNodesPerFile;
 
-export const buildJavaScriptSemanticGraph = ({
-  rootArtifactSha256,
-  applicationGraph,
-  analysis,
-}: BuilderInput): JavaScriptSemanticGraph => {
-  const projection = createJavaScriptSemanticGraphProjection();
-  for (const analyzed of analysis.files) {
-    if (analyzed.semantic !== null)
-      projection.projectFile(
-        analyzed.file,
-        analyzed.semantic.ir,
-        analyzed.javascript?.electron.call_paths,
-      );
-    else if (
-      !analyzed.file.text.included &&
-      analyzed.file.text.reason === "outside-analysis-scope"
-    )
-      projection.recordUnavailableFile(
-        analyzed.file,
-        "Source was not analyzed because it is outside the caller-selected source_paths.",
-        null,
-        "incomplete-module",
-      );
-  }
-  return projection.finish(rootArtifactSha256, applicationGraph);
-};
-
 /** File-local semantic projection that does not retain consumed source IR. */
 export interface JavaScriptSemanticGraphProjection {
   /** Node capacity offered to the next independently analyzed source file. */
@@ -198,11 +166,11 @@ export interface JavaScriptSemanticGraphProjection {
   ) => Generator<void, void>;
   readonly finish: (
     rootArtifactSha256: string,
-    applicationGraph: BuilderInput["applicationGraph"],
+    applicationGraph: ApplicationGraph,
   ) => JavaScriptSemanticGraph;
   readonly finishImmutableSteps: (
     rootArtifactSha256: string,
-    applicationGraph: BuilderInput["applicationGraph"],
+    applicationGraph: ApplicationGraph,
   ) => Generator<void, JavaScriptSemanticGraph>;
 }
 
@@ -329,7 +297,7 @@ export const createJavaScriptSemanticGraphProjection = (
   const finishWith = <Value>(
     factory: (input: unknown) => Value,
     rootArtifactSha256: string,
-    applicationGraph: BuilderInput["applicationGraph"],
+    applicationGraph: ApplicationGraph,
   ): Value => {
     bindSemanticGraphApplicationNodes(state, applicationGraph);
     if (state.roots.size === 0) addFallbackRoot(rootArtifactSha256, state);
@@ -706,6 +674,8 @@ function* projectFileSteps(
     returnSiteNodes,
     argumentNodes: new Map(),
     referenceNodes: [],
+    readNodes: [],
+    writeNodes: [],
     callResolutions: new Map(
       ir.callSites.map((call) => [
         call.callSiteId,
@@ -803,14 +773,102 @@ function* createCallSiteNodes(
       call.callerCallableId === null
         ? null
         : (callables.get(call.callerCallableId)?.node_id ?? null);
-    const node = retainNode(state, file, {
-      kind: "call-site",
+    const nodeInput = {
+      kind: "call-site" as const,
       roleKey: `call:${call.callSiteId}`,
       location: call.location,
       label: call.kind,
       functionNodeId: owner,
+    };
+    // Include the complete node and worker JSON envelope before retaining any
+    // arguments. Each entry is charged by its encoded size and comma, so even
+    // worst-case escaping cannot overflow the worker's single-record ceiling.
+    let recordBytes = 0;
+    if (call.arguments.some((argument) => Object.hasOwn(argument, "literal"))) {
+      const baseline = constructSemanticGraphNode(file, nodeInput, state);
+      recordBytes = Buffer.byteLength(
+        `${JSON.stringify({ kind: "node", value: { ...baseline, properties: { arguments: [] } } })}\n`,
+      );
+    }
+    const argumentsValue: JsonValue[] = [];
+    let transferOmitted = 0;
+    for (const argument of call.arguments) {
+      if (!Object.hasOwn(argument, "literal")) continue;
+      const item = {
+        index: argument.index,
+        value: argument.literal ?? null,
+        source_range:
+          argument.valueExpressionLocation === null
+            ? null
+            : {
+                start: { ...argument.valueExpressionLocation.start },
+                end: { ...argument.valueExpressionLocation.end },
+              },
+      };
+      const size =
+        Buffer.byteLength(JSON.stringify(item)) +
+        (argumentsValue.length === 0 ? 0 : 1);
+      if (recordBytes + size > JAVASCRIPT_ANALYSIS_TRANSFER_RECORD_BYTES) {
+        transferOmitted += 1;
+        continue;
+      }
+      argumentsValue.push(item);
+      recordBytes += size;
+    }
+    const node = retainNode(state, file, {
+      ...nodeInput,
+      ...(argumentsValue.length === 0
+        ? {}
+        : { properties: { arguments: argumentsValue } }),
     });
-    if (node !== null) result.set(call.callSiteId, node);
+    if (node !== null) {
+      result.set(call.callSiteId, node);
+      if (transferOmitted > 0) {
+        const detail = `${String(transferOmitted)} direct call arguments exceeded the ${String(JAVASCRIPT_ANALYSIS_TRANSFER_RECORD_BYTES)}-byte worker transfer record ceiling.`;
+        addSemanticGraphUnknown(state, {
+          node_id: node.node_id,
+          family: "call-flow",
+          relation_kinds: ["argument-to-parameter"],
+          reason: "resource-limit",
+          detail,
+          candidate_node_ids: [],
+          evidence: {
+            ...unknownSemanticEvidence(file, call.location),
+            coverage: partialApplicationCoverage(
+              javaScriptAnalysisCoverageLimits({
+                transfer_record_bytes:
+                  JAVASCRIPT_ANALYSIS_TRANSFER_RECORD_BYTES,
+              }),
+              null,
+            ),
+            limitations: [detail],
+          },
+        });
+      }
+      if (
+        call.arguments.some(
+          (argument) => argument.literalResourceLimit === "primitive-bytes",
+        )
+      ) {
+        const limit = "primitive-bytes";
+        addSemanticGraphUnknown(state, {
+          node_id: node.node_id,
+          family: "call-flow",
+          relation_kinds: ["argument-to-parameter"],
+          reason: "resource-limit",
+          detail: semanticResourceLimitReason(limit),
+          candidate_node_ids: [],
+          evidence: {
+            ...unknownSemanticEvidence(file, call.location),
+            coverage: partialApplicationCoverage(
+              semanticResourceLimitCoverage([limit]),
+              null,
+            ),
+            limitations: [semanticResourceLimitReason(limit)],
+          },
+        });
+      }
+    }
   }
   return result;
 }
@@ -852,7 +910,11 @@ function* projectDefinitionsAndReferences(
       reference.bindingId === null
         ? undefined
         : context.bindingNodes.get(reference.bindingId);
-    if (expression !== null) context.referenceNodes.push(expression);
+    if (expression !== null) {
+      context.referenceNodes.push(expression);
+      if (reference.role === "read") context.readNodes.push(expression);
+      if (reference.role === "write") context.writeNodes.push(expression);
+    }
     if (binding === undefined || expression === null) continue;
     if (reference.role === "read")
       addRelation(context.state, {
@@ -971,6 +1033,7 @@ const FILE_PROJECTION_PASSES: readonly ((
 ) => Iterator<void, void> | void)[] = [
   projectSemanticValues,
   projectSemanticObjects,
+  projectSemanticAssignments,
   projectCalls,
   projectSemanticPromises,
   projectSemanticEvents,

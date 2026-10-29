@@ -1,12 +1,22 @@
-import type { ElectronApplication, Page } from "playwright-core";
+import type { ElectronApplication, JSHandle, Page } from "playwright-core";
 import { z } from "zod";
+import { runWithExecutionLimits } from "./PlaywrightElectronExecution.js";
 
 import type { ExecutionOptions } from "../application/AnalysisProvider.js";
+import type {
+  ArtifactResourceScope,
+  ArtifactResourceOwner,
+} from "../artifacts/ArtifactResourceScope.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import {
   electronActiveTimelineEventSchema,
   electronActiveProcessMetricSchema,
   electronActiveWindowSchema,
+  electronActiveObservationResultSchema,
   type ElectronActiveObservationInput,
   type ElectronActiveObservationResult,
 } from "../domain/javascript/electronActiveObservation.js";
@@ -19,35 +29,32 @@ const OPERATION = "capture_electron_scenario" as const;
 const CANCELLED_STATE_READ_TIMEOUT_MS = 5_000;
 const GRACE_EXPIRED = Symbol("cancellation grace expired");
 
+const retention = electronActiveObservationResultSchema.shape.retention.shape;
 const hookSnapshotSchema = z.strictObject({
   events: z.array(electronActiveTimelineEventSchema),
-  retention_budget_bytes: z.number().int().min(0),
-  estimated_retained_bytes: z.number().int().min(0),
-  event_serialized_byte_upper_bound: z.number().int().min(0),
-  retained: z.number().int().min(0),
-  dropped: z.number().int().min(0),
-  dropped_ipc: z.number().int().min(0),
-  dropped_runtime: z.number().int().min(0),
-  dropped_event_families: z.array(
-    z.strictObject({
-      family: z.string().min(1),
-      count: z.number().int().min(1),
-    }),
-  ),
-  dropped_event_roles: z.array(
-    z.strictObject({
-      role: z.string().min(1),
-      count: z.number().int().min(1),
-    }),
-  ),
-  observed: z.number().int().min(0),
-  observed_ipc: z.number().int().min(0),
-  observed_runtime: z.number().int().min(0),
+  retention_budget_bytes: retention.budget_bytes,
+  estimated_retained_bytes: retention.estimated_retained_bytes,
+  event_serialized_byte_upper_bound:
+    retention.event_serialized_byte_upper_bound,
+  retained: retention.retained,
+  dropped: retention.dropped,
+  dropped_ipc: retention.dropped_ipc,
+  dropped_runtime: retention.dropped_runtime,
+  dropped_event_families: retention.dropped_event_families,
+  dropped_event_roles: retention.dropped_event_roles,
+  observed: z.int().min(0),
+  observed_ipc: retention.observed_ipc,
+  observed_runtime: retention.observed_runtime,
   hook_error: z.boolean(),
 });
 
 type ElectronAction = ElectronActiveObservationInput["actions"][number];
 type ElectronActions = ElectronActiveObservationResult["actions"];
+type SelectedElectronWindow = JSHandle<{
+  readonly id: number;
+  isDestroyed(): boolean;
+  readonly webContents: { forcefullyCrashRenderer(): void };
+}>;
 
 export type ElectronHookSnapshot = z.infer<typeof hookSnapshotSchema>;
 export type ElectronHookEvent = z.infer<
@@ -70,8 +77,13 @@ export const runElectronActions = async (
   application: ElectronApplication,
   input: ElectronActiveObservationInput,
   options: ExecutionOptions,
-): Promise<ElectronActions> => {
+  resources: ArtifactResourceScope,
+): Promise<{
+  readonly actions: ElectronActions;
+  readonly cleanupError?: AnalysisError;
+}> => {
   const actions: ElectronActions = [];
+  let cleanupError: AnalysisError | undefined;
   let stoppedBy: ScenarioActionStop | undefined;
   for (const action of input.actions) {
     const actionStartedAt = performance.now();
@@ -89,6 +101,10 @@ export const runElectronActions = async (
       continue;
     }
     let selectedWindow: Page | undefined;
+    let selectedHandle: SelectedElectronWindow | undefined;
+    let handleOwner: ArtifactResourceOwner | undefined;
+    let target: string | null = null;
+    let actionError: string | null = null;
     try {
       if (options.signal?.aborted === true)
         throw new BrowserObservationError(OPERATION, "cancelled");
@@ -100,57 +116,139 @@ export const runElectronActions = async (
               windowIndex,
               signal: options.signal,
             });
-      if (
-        (action.kind === "click" ||
-          action.kind === "renderer-reload" ||
-          action.kind === "renderer-crash") &&
-        selectedWindow === undefined
-      )
-        throw new BrowserObservationError(OPERATION, "window_not_found");
+      if (selectedWindow !== undefined) {
+        const selected = ownActionWindow(
+          application,
+          selectedWindow,
+          resources,
+        );
+        handleOwner = selected.owner;
+        selectedHandle = await runWithExecutionLimits(
+          selected.handle,
+          options.signal,
+        );
+        const id = z
+          .int()
+          .safe()
+          .nonnegative()
+          .parse(
+            await runWithExecutionLimits(
+              selectedHandle.evaluate((window) => window.id),
+              options.signal,
+            ),
+          );
+        target = `window:${String(id)}`;
+      }
 
       await runAction({
         application,
         action,
         selectedWindow,
+        selectedHandle,
         options,
-      });
-      actions.push({
-        step_id: action.step_id,
-        kind: action.kind,
-        window_index: windowIndex,
-        target:
-          selectedWindow === undefined ? null : `window:${String(windowIndex)}`,
-        status: "completed",
-        elapsed_ms: Math.max(
-          0,
-          Math.round(performance.now() - actionStartedAt),
-        ),
-        error: null,
       });
     } catch (cause: unknown) {
       stoppedBy = options.signal?.aborted ? "cancelled" : "failed";
-      actions.push({
-        step_id: action.step_id,
-        kind: action.kind,
-        window_index: windowIndex,
-        target:
-          selectedWindow === undefined ? null : `window:${String(windowIndex)}`,
-        status: stoppedBy,
-        elapsed_ms: Math.max(
-          0,
-          Math.round(performance.now() - actionStartedAt),
-        ),
-        error: safeActionErrorMessage(cause),
-      });
+      actionError = safeActionErrorMessage(cause);
+    }
+    const outcome =
+      actionError === null
+        ? { status: "completed" as const, error: null }
+        : { status: stoppedBy ?? "failed", error: actionError };
+    actions.push({
+      step_id: action.step_id,
+      kind: action.kind,
+      window_index: windowIndex,
+      target,
+      ...outcome,
+      elapsed_ms: Math.max(0, Math.round(performance.now() - actionStartedAt)),
+    });
+    if (handleOwner !== undefined) {
+      cleanupError = await releaseActionWindow(
+        resources,
+        handleOwner,
+        stoppedBy ?? "completed",
+        options.signal,
+      );
+      if (cleanupError !== undefined) stoppedBy = "failed";
     }
   }
-  return actions;
+  return { actions, ...(cleanupError === undefined ? {} : { cleanupError }) };
+};
+
+const ownActionWindow = (
+  application: ElectronApplication,
+  page: Page,
+  resources: ArtifactResourceScope,
+): {
+  readonly handle: Promise<SelectedElectronWindow>;
+  readonly owner: ArtifactResourceOwner;
+} => {
+  const handle = Promise.resolve().then(() => application.browserWindow(page));
+  let disposing: Promise<void> | undefined;
+  const owner: ArtifactResourceOwner = {
+    kind: "lease",
+    resource: "selected Electron BrowserWindow handle",
+    lease: {
+      release: async () => {
+        if (disposing === undefined) {
+          const attempt = handle.then(
+            (selected) => selected.dispose(),
+            () => undefined,
+          );
+          disposing = attempt;
+          void attempt.catch(() => {
+            if (disposing === attempt) disposing = undefined;
+          });
+        }
+        await runWithExecutionLimits(
+          disposing,
+          undefined,
+          performance.now() + CANCELLED_STATE_READ_TIMEOUT_MS,
+        );
+      },
+    },
+  };
+  resources.retain(owner);
+  return { handle, owner };
+};
+
+const releaseActionWindow = async (
+  resources: ArtifactResourceScope,
+  owner: ArtifactResourceOwner,
+  actionStatus: ElectronActions[number]["status"],
+  signal: AbortSignal | undefined,
+): Promise<AnalysisError | undefined> => {
+  const released = await resources.release(owner);
+  if (released.kind === "released") return undefined;
+  const error = new ProviderCleanupError(
+    "playwright-electron-active",
+    released.lease.cleanupResources ?? [owner.resource],
+    {
+      reason: safeActionErrorMessage(released.cause),
+    },
+    { cause: released.cause, operation: OPERATION },
+  );
+  error.bindCleanupResourceOwner(released.lease);
+  released.lease.bindCleanupError(error);
+  if (!signal?.aborted) return error;
+  const cancellation = new AnalysisCancelledError(OPERATION, {
+    cause: signal.reason,
+  });
+  return actionStatus === "failed"
+    ? error.retainSecondaryFailure(cancellation)
+    : analysisErrorWithCleanupFailure(
+        cancellation,
+        error,
+        OPERATION,
+      ).bindCleanupDependencies([cancellation, error]);
 };
 
 type RunActionContext = {
   readonly application: ElectronApplication;
   readonly action: ElectronAction;
   readonly selectedWindow: Page | undefined;
+  readonly selectedHandle: SelectedElectronWindow | undefined;
   readonly options: ExecutionOptions;
 };
 
@@ -158,6 +256,7 @@ const runAction = async ({
   application,
   action,
   selectedWindow,
+  selectedHandle,
   options,
 }: RunActionContext): Promise<void> => {
   switch (action.kind) {
@@ -197,13 +296,14 @@ const runAction = async ({
       );
       return;
     case "renderer-crash": {
+      if (selectedHandle === undefined)
+        throw new BrowserObservationError(OPERATION, "window_not_found");
       const crashed = await runWithExecutionLimits(
-        application.evaluate(({ BrowserWindow }, index) => {
-          const candidate = BrowserWindow.getAllWindows()[index];
-          if (candidate === undefined || candidate.isDestroyed()) return false;
-          candidate.webContents.forcefullyCrashRenderer();
+        selectedHandle.evaluate((window) => {
+          if (window.isDestroyed()) return false;
+          window.webContents.forcefullyCrashRenderer();
           return true;
-        }, action.window_index),
+        }),
         options.signal,
       );
       if (!crashed)
@@ -273,7 +373,6 @@ const emitDeepLink = (
   );
 
 /** Read the current Electron windows, metrics, and hook snapshot. */
-// oxlint-disable-next-line max-lines-per-function -- one state read must share one capture boundary.
 export const readApplicationState = async (
   application: ElectronApplication,
 ): Promise<{
@@ -408,55 +507,6 @@ export const readFinalApplicationState = async (
       cancellation_grace_ms: CANCELLED_STATE_READ_TIMEOUT_MS,
     },
   });
-};
-
-/** Apply an optional lifecycle deadline and caller cancellation to an operation. */
-export const runWithExecutionLimits = async <Value>(
-  operation: Promise<Value>,
-  signal: AbortSignal | undefined,
-  deadline?: number,
-): Promise<Value> => {
-  if (signal?.aborted === true) {
-    // The operation has already started; observe its abandoned settlement.
-    void operation.catch(() => undefined);
-    throw new BrowserObservationError(OPERATION, "cancelled", {
-      cause: signal.reason,
-    });
-  }
-  if (signal === undefined && deadline === undefined) return operation;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let abortListener: (() => void) | undefined;
-  const interruptions: Promise<never>[] = [];
-  if (deadline !== undefined)
-    interruptions.push(
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new BrowserObservationError(OPERATION, "timeout")),
-          Math.max(1, deadline - performance.now()),
-        );
-      }),
-    );
-  if (signal !== undefined)
-    interruptions.push(
-      new Promise<never>((_, reject) => {
-        abortListener = () =>
-          reject(
-            new BrowserObservationError(OPERATION, "cancelled", {
-              cause: signal.reason,
-            }),
-          );
-        signal.addEventListener("abort", abortListener, { once: true });
-      }),
-    );
-  try {
-    return interruptions.length === 0
-      ? await operation
-      : await Promise.race([operation, ...interruptions]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-    if (abortListener !== undefined)
-      signal?.removeEventListener("abort", abortListener);
-  }
 };
 
 const safeActionErrorMessage = (cause: unknown): string => {
