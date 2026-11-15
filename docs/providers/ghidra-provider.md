@@ -362,6 +362,21 @@ flag and affected callers are repaired in the same pass. Unknown imports and
 genuine no-return imports keep their flags. Analysis profiles version this repair
 so snapshots produced before it are not reused. Windows P0 does not run it.
 
+Ghidra applies most loader relocations, but it cannot apply some, such as an
+ELF copy relocation into RELRO (for example musl's `stderr`). Those destinations
+keep their file bytes while the runtime loader writes another object's value.
+Before decompiling, a fresh non-Windows import marks each loaded, initialized,
+non-writable block that holds such an unapplied relocation destination volatile
+in the ephemeral database, so the decompiler cannot fold the on-disk value into
+a constant. Applied relocations such as GOT entries stay foldable, so external
+calls keep their names. Permissions and source `FileBytes` are unchanged; the
+whole block is affected because Ghidra sets volatility per block. A procedure
+that reads an unapplied destination adds a limitation naming the relocation.
+Windows P0 and existing projects (`REA_GHIDRA_PROJECT_PATH`) have no
+database-mutation authority: they add the same limitation, but their pseudocode
+may still show the file-backed value. ELF relocatable objects and core files are
+excluded. Analysis profiles version this behavior.
+
 `npm run verify:ghidra` compiles the versioned C oracle into debug and stripped
 host-native targets (x86-64/AArch64 ELF on Linux or Mach-O on macOS), plus a native
 DWARF 4 type-layout object. It proves the admitted operations, external functions, resolved thunks, exports, stripped-name
@@ -423,10 +438,17 @@ offset for that starting address (or null), and containing procedure (or null).
 A starting offset does not imply the full match is contiguous in the file.
 
 Pages default to 100 matches and accept 1 to 1000. Pass `next_cursor` as `cursor`
-with the same target, profile, pattern, mask and bounds to continue. `complete`
-means no further matches remain. `searched.blocks` and `searched.bytes` describe
-the inclusive memory ranges examined for this page, including lookahead for the
-next match. Coverage can overlap between pages; do not sum it as unique memory.
+with the same target, analysis profile or selected project, pattern, mask,
+bounds, and document to continue. A cursor from a different binding is
+rejected. The message names those bound values and states that the cursor does
+not identify which one differs; select the original context or start a new
+search without the cursor. The request matches the input schema, so the error
+carries no `inspect_input_contract` recovery. `details.issues[0].path` is
+`cursor`, and `details.issues[0].observed.differing_component` is `unknown`.
+`complete` means no further matches remain. `searched.blocks` and
+`searched.bytes` describe the inclusive memory ranges examined for this page,
+including lookahead for the next match. Coverage can overlap between pages; do
+not sum it as unique memory.
 `searched.skipped_uninitialized` lists eligible uninitialized blocks on every
 page. These blocks are never searched. Cancellation returns a typed error,
 discards the active Ghidra database, and does not return a successful partial page.

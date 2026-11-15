@@ -1,6 +1,7 @@
 import { GDB_PROVIDER_IDENTITY } from "./GdbProviderIdentity.js";
 import { persistentDebuggerHostSupported } from "../process/PersistentDebuggerHost.js";
 import { ABORTED, waitForAbortable } from "../process/AbortablePromise.js";
+import { classifyLaunchFailure } from "../process/launchFailure.js";
 import { snapshotGdbCommandRecords } from "./GdbCommandRecords.js";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -12,6 +13,8 @@ import {
   AnalysisCancelledError,
   AnalysisInputError,
   AnalysisTimeoutError,
+  cancelledBy,
+  OwnerCancellation,
 } from "../domain/analysisErrorCore.js";
 import {
   GDB_SESSION_TOOLS,
@@ -51,12 +54,14 @@ import {
   debuggerResourceConstraintError,
   fixedDeadlineGuidance,
   readLinuxProcessStartTime,
+  retainedDebuggerCleanupFailure,
   stopOwnedDebuggerProcess,
   type OwnedDebuggerDetachResult,
   type OwnedInferiorIdentity,
   type ProcessStartTimeReader,
   verifyOwnedInferiorsEnded,
 } from "../process/ownedDebuggerSession.js";
+import { utf8HeadExcerpt } from "../domain/utf8HeadExcerpt.js";
 
 const STARTUP_TIMEOUT_MS = 10_000;
 
@@ -194,15 +199,7 @@ const truncateUtf8RecordPrefix = (line: string): string => {
   const budget =
     MAX_RECENT_MI_LINE_BYTES -
     Buffer.byteLength(RECENT_RECORD_TRUNCATION_MARKER, "utf8");
-  let prefix = "";
-  let retainedBytes = 0;
-  for (const codePoint of line) {
-    const codePointBytes = Buffer.byteLength(codePoint, "utf8");
-    if (retainedBytes + codePointBytes > budget) break;
-    prefix += codePoint;
-    retainedBytes += codePointBytes;
-  }
-  return `${prefix}${RECENT_RECORD_TRUNCATION_MARKER}`;
+  return `${utf8HeadExcerpt(line, budget).text}${RECENT_RECORD_TRUNCATION_MARKER}`;
 };
 
 /** Bound parser memory when a capped MI record contains extreme nesting. */
@@ -701,7 +698,7 @@ export class GdbSessionManager {
       return err(
         signal?.aborted
           ? cancelledWithCallerReason("start_gdb_session", signal)
-          : new AnalysisCancelledError("start_gdb_session"),
+          : cancelledBy("start_gdb_session", OwnerCancellation.ownerClosed),
       );
     if (!persistentDebuggerHostSupported(this.#platform))
       return err(
@@ -850,16 +847,11 @@ export class GdbSessionManager {
         cause instanceof AnalysisCancelledError
       )
         return err(new AnalysisCancelledError("start_gdb_session", { cause }));
-      const code: unknown =
-        cause instanceof Error && "code" in cause ? cause.code : undefined;
-      if (
-        cause instanceof Error &&
-        typeof code === "string" &&
-        ["ENOENT", "EACCES", "EPERM", "ENOEXEC", "ENOTDIR", "EISDIR"].includes(
-          code,
-        )
-      )
-        return err(new GdbExecutableRefusal(this.#command, code, cause));
+      const refusal = classifyLaunchFailure(cause);
+      if (refusal !== undefined && cause instanceof Error)
+        return err(
+          new GdbExecutableRefusal(this.#command, refusal.code, cause),
+        );
       return err(
         new AnalysisCapabilityUnavailableError(
           "gdb",
@@ -1503,7 +1495,9 @@ export class GdbSessionManager {
     >
   > {
     if (this.#closing)
-      return err(new AnalysisCancelledError("close_gdb_session"));
+      return err(
+        cancelledBy("close_gdb_session", OwnerCancellation.ownerClosed),
+      );
     const session = this.#sessions.get(sessionId);
     if (session === undefined) return err(gdbCloseUnavailable());
     if (session.exited) return this.#finishSessionCleanup(session);
@@ -2014,11 +2008,12 @@ export class GdbSessionManager {
     reason: string,
     options: AnalysisErrorOptions = {},
   ): AnalysisError {
-    const failure = new AnalysisCapabilityUnavailableError(
-      "gdb",
+    const failure = retainedDebuggerCleanupFailure(
+      { provider: "gdb", displayName: "GDB" },
       operation,
-      `The owned GDB process could not be confirmed stopped: ${reason}`,
-      { ...options, cleanup: { reason, resources: [session.id] } },
+      reason,
+      [session.id],
+      options,
     );
     session.cleanupFailures.add(failure);
     return failure;
@@ -2327,10 +2322,15 @@ export class GdbSessionManager {
             );
             return;
           }
+          const cancellation = new AnalysisCancelledError("gdb_console", {
+            cause: signal?.reason,
+            partialObservation: evidence,
+          });
           const cleanupFailure = this.#retainCleanupFailure(
             session,
             "gdb_console",
             stopped.reason,
+            { cause: cancellation },
           );
           pending.reject(
             new AnalysisCancelledError("gdb_console", {
