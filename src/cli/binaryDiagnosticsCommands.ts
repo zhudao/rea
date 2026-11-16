@@ -17,7 +17,6 @@ import {
   createWindowsShortcutService,
   createNativeExportsService,
 } from "../composition/binaryDiagnostics.js";
-import { CLI_COMMANDS } from "../cliCommandNames.js";
 import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
@@ -26,10 +25,12 @@ import { BYTE_ENTROPY_PROVIDER } from "../domain/investigationProviders.js";
 import { BINARY_DIAGNOSTICS_TOOL_CONTRACTS } from "../contracts/native/binaryDiagnosticsToolContracts.js";
 import { contractNamed } from "./contractCliDescription.js";
 import {
+  callerTargetPath,
   deliverWithService,
   inspectWithService,
   registerContractCommand,
 } from "./contractCommand.js";
+import { PRODUCER_LIMITS_HELP } from "./producerLimitsOption.js";
 
 type BinaryDiagnosticsOperation =
   (typeof BINARY_DIAGNOSTICS_TOOL_CONTRACTS)[number]["name"];
@@ -48,7 +49,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_elf_notes"),
     {
-      command: CLI_COMMANDS.inspectElfNotes,
       description:
         "Inspect ELF PT_NOTE and SHT_NOTE identities without executing the image",
       positionals: ["path"],
@@ -62,7 +62,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_native_initializers"),
     {
-      command: CLI_COMMANDS.inspectNativeInitializers,
       description:
         "List ELF and Mach-O initializer and finalizer functions without executing the image",
       positionals: ["path"],
@@ -88,7 +87,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_elf_unwind_ranges"),
     {
-      command: CLI_COMMANDS.inspectElfUnwindRanges,
       description:
         "Inspect ELF unwind function ranges without executing the image",
       positionals: ["path"],
@@ -102,7 +100,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_apple_ips"),
     {
-      command: CLI_COMMANDS.inspectAppleIps,
       description:
         "Inspect an Apple .ips crash report without executing a target",
       positionals: ["path"],
@@ -122,7 +119,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_kernel_module"),
     {
-      command: CLI_COMMANDS.inspectKernelModule,
       description:
         "Inspect Linux kernel module metadata without executing the module",
       positionals: ["path"],
@@ -141,7 +137,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_kernel_build_config"),
     {
-      command: CLI_COMMANDS.inspectKernelBuildConfig,
       description:
         "Inspect a Linux kernel image's version banner and embedded build config without executing it",
       positionals: ["path"],
@@ -163,7 +158,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_pe_load_config"),
     {
-      command: CLI_COMMANDS.inspectPeLoadConfig,
       description:
         "Inspect PE TLS callbacks and load configuration without executing the image",
       positionals: ["path"],
@@ -177,7 +171,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_binary_hardening"),
     {
-      command: CLI_COMMANDS.inspectBinaryHardening,
       description:
         "Inspect ELF, PE, and Mach-O hardening without executing the image",
       positionals: ["path"],
@@ -192,7 +185,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_byte_entropy"),
     {
-      command: CLI_COMMANDS.inspectByteEntropy,
       description:
         "Inspect file-wide and block byte entropy without executing the file",
       positionals: ["path"],
@@ -219,7 +211,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_pe_certificates"),
     {
-      command: CLI_COMMANDS.inspectPeCertificates,
       description:
         "Inspect PE Authenticode certificate table identities without verifying signatures",
       positionals: ["path"],
@@ -233,7 +224,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_pe_imports"),
     {
-      command: CLI_COMMANDS.inspectPeImports,
       description:
         "Inspect PE import and delay-load table identities without executing the image",
       positionals: ["path"],
@@ -247,7 +237,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_windows_shortcut"),
     {
-      command: CLI_COMMANDS.inspectWindowsShortcut,
       description:
         "Inspect a Windows Shell Link (.lnk) without resolving or executing the target",
       positionals: ["path"],
@@ -263,7 +252,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_pe_resources"),
     {
-      command: CLI_COMMANDS.inspectPeResources,
       description:
         "Inspect PE resource identities, payload ranges, hashes and icon-group relationships",
       positionals: ["path"],
@@ -277,7 +265,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_devicetree"),
     {
-      command: CLI_COMMANDS.inspectDevicetree,
       description: "Inspect a flattened devicetree blob without executing it",
       positionals: ["path"],
       callerPaths: ["path"],
@@ -299,7 +286,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_native_exports"),
     {
-      command: CLI_COMMANDS.inspectNativeExports,
       description:
         "Inspect a PE or ELF image's export table without executing it",
       positionals: ["path"],
@@ -309,15 +295,12 @@ export const registerBinaryDiagnosticsCommands = (
     },
     deliverWithService(createNativeExportsService, "rea-native-exports"),
   );
-  const producerLimitsHelp =
-    "JSON producer budget overrides. Keys and units follow this operation's producer_limits contract; changes apply on this call without restart and preserve tighter inherited OS limits.";
   const layout = createBinaryLayoutService(environment);
   registerContractCommand(
     cli,
     logger,
     contract("inspect_binary_layout"),
     {
-      command: CLI_COMMANDS.inspectBinaryLayout,
       description:
         "Inspect binary file/linked layout without executing the selected object",
       positionals: ["path"],
@@ -325,17 +308,19 @@ export const registerBinaryDiagnosticsCommands = (
       jsonText: ["producer_limits"],
       fields: {
         path: { description: "Local ELF binary or relocatable object" },
-        producer_limits: { description: producerLimitsHelp },
+        producer_limits: { description: PRODUCER_LIMITS_HELP },
       },
       omit: {
         detail:
           "One-shot output is complete Evidence; this command has no summary delivery",
       },
     },
-    async (input, { signal, callerInputs }) => {
-      const result = await layout.inspectAndClose(input, { signal });
+    async (input, context) => {
+      const result = await layout.inspectAndClose(input, {
+        signal: context.signal,
+      });
       return result.ok
-        ? withEvidenceCallerInputPath(result.value, callerInputs.path)
+        ? withEvidenceCallerInputPath(result.value, callerTargetPath(context))
         : projectAnalysisError(result.error);
     },
   );
@@ -345,7 +330,6 @@ export const registerBinaryDiagnosticsCommands = (
     logger,
     contract("inspect_recorded_crash"),
     {
-      command: CLI_COMMANDS.inspectRecordedCrash,
       description:
         "Inspect supplied core registers/signals and optional debugger mapping evidence",
       positionals: ["path"],
@@ -355,17 +339,19 @@ export const registerBinaryDiagnosticsCommands = (
         path: {
           description: "Local Linux ELF64 amd64 or AArch64 little-endian core",
         },
-        producer_limits: { description: producerLimitsHelp },
+        producer_limits: { description: PRODUCER_LIMITS_HELP },
         include_debugger_context: {
           name: "debuggerContext",
           description: "Add BYO core-only GDB/pwndbg mapping candidates",
         },
       },
     },
-    async (input, { signal, callerInputs }) => {
-      const result = await recorded.inspectAndClose(input, { signal });
+    async (input, context) => {
+      const result = await recorded.inspectAndClose(input, {
+        signal: context.signal,
+      });
       return result.ok
-        ? withEvidenceCallerInputPath(result.value, callerInputs.path)
+        ? withEvidenceCallerInputPath(result.value, callerTargetPath(context))
         : projectAnalysisError(result.error);
     },
   );
