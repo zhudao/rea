@@ -23,6 +23,7 @@ import { fixedAllowanceOptions } from "../../domain/fixedAllowanceRemediation.js
 import {
   ELF_DEBUG_LINK_CANDIDATE_INCOMPLETE_LIMITATION,
   ELF_DEBUG_LINK_CANDIDATE_COMPARISON_INCOMPLETE_LIMITATION,
+  ELF_DEBUG_LINK_READ_BUDGETS,
   MAX_ELF_DEBUG_CANDIDATE_BYTES,
   MAX_INSPECT_ELF_DEBUG_LINK_ENTRIES,
   MAX_INSPECT_ELF_DEBUG_LINK_FILE_BYTES,
@@ -46,6 +47,7 @@ import {
 } from "./ElfDebugLink.js";
 import { ELF_NOTE_TEXT_ALLOWANCE } from "./ElfNoteParser.js";
 import { elfSectionNameBudget } from "../../domain/native/elfSectionNameTable.js";
+import { elfReadBudgetLimit } from "../../domain/native/elfReadBudgets.js";
 
 const OPERATION = "inspect_elf_debug_link";
 const HEADER_PREFIX_BYTES = 4096;
@@ -74,14 +76,14 @@ export class ElfDebugLinkProvider implements ElfDebugLinkPort {
     let candidatePhase: CandidatePhase | undefined;
     let candidate: StableArtifactStream | undefined;
     let crc32 = 0;
-    let parsedImage: ElfDebugLink | undefined;
+    let completedImage: ElfDebugLink | undefined;
     let observedImage:
       | { readonly sha256: string; readonly bytes: number }
       | undefined;
     try {
       return await this.#resources.run(async () => {
         field = "path";
-        const image = await withStableArtifactHandle(
+        const image = await withStableArtifactHandle<ElfDebugLink>(
           input.path,
           input.max_file_bytes,
           {
@@ -91,9 +93,12 @@ export class ElfDebugLinkProvider implements ElfDebugLinkPort {
             onIdentity: (identity) => {
               observedImage = identity;
             },
+            onVerifiedResult: (value) => {
+              completedImage = value;
+            },
           },
-          async (handle) => {
-            parsedImage = await parseElfDebugLinkFromHandle(
+          (handle) =>
+            parseElfDebugLinkFromHandle(
               {
                 size: handle.size,
                 prefix: handle.prefix,
@@ -106,9 +111,7 @@ export class ElfDebugLinkProvider implements ElfDebugLinkPort {
               },
               input,
               options?.signal,
-            );
-            return parsedImage;
-          },
+            ),
         );
         if (input.candidate_path === undefined) return ok(image);
         field = "candidate_path";
@@ -154,16 +157,11 @@ export class ElfDebugLinkProvider implements ElfDebugLinkPort {
           input,
           candidate,
         );
-      else if (
-        parsedImage !== undefined &&
-        artifactFileCompletion(cause)?.value === parsedImage
-      ) {
-        // Only the file owner can establish that the decoded image passed
-        // the final stability check before release was interrupted.
+      else if (completedImage !== undefined) {
         retained =
           input.candidate_path === undefined
-            ? parsedImage
-            : incompleteCandidateObservation(parsedImage);
+            ? completedImage
+            : incompleteCandidateObservation(completedImage);
       }
       return err(
         elfDebugLinkFailure(cause, input, field, {
@@ -357,6 +355,11 @@ const elfDebugLinkFailure = (
         if (isParseLimit(failure, "elf") && sectionNameBudget !== undefined)
           return parseLimitConstraint(OPERATION, "memory", failure, {
             retryable: false,
+            limit: elfReadBudgetLimit(
+              ELF_DEBUG_LINK_READ_BUDGETS,
+              "max_file_bytes",
+              input.max_file_bytes,
+            ),
             remediationAction: sectionNameBudgetRemediation(
               sectionNameBudget.required,
               field,
@@ -382,6 +385,11 @@ const elfDebugLinkFailure = (
             entryBudget
               ? {
                   retryable: false,
+                  limit: elfReadBudgetLimit(
+                    ELF_DEBUG_LINK_READ_BUDGETS,
+                    "max_entries",
+                    input.max_entries,
+                  ),
                   remediationAction: inputBudgetRemediation(
                     "capacity",
                     input,
@@ -423,6 +431,11 @@ const elfDebugLinkFailure = (
               )
             : {
                 retryable: false,
+                limit: elfReadBudgetLimit(
+                  ELF_DEBUG_LINK_READ_BUDGETS,
+                  "max_file_bytes",
+                  input.max_file_bytes,
+                ),
                 remediationAction: inputBudgetRemediation(
                   "file-size",
                   input,

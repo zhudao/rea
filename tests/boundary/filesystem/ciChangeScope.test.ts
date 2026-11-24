@@ -1,4 +1,5 @@
 import {
+  access,
   chmod,
   cp,
   mkdir,
@@ -119,6 +120,8 @@ async function runPlanScript(
         ...process.env,
         BASE_SHA: base,
         HEAD_SHA: head,
+        GITHUB_SHA: head,
+        CI_RECORD_TEST_SHADOW: "true",
         GITHUB_EVENT_NAME: event,
         CI_FULL: String(full),
         CI_SKIP_FULL: String(skipFull),
@@ -445,6 +448,23 @@ it("does not credit a fixture test as coverage for an unrelated shared script", 
   });
 });
 
+it("traces an exact template import alongside an unrelated changed test", async () => {
+  const { directory } = await fixture();
+  const source = "src/example/Probe.ts";
+  const test = "tests/boundary/filesystem/templateImport.test.ts";
+  const unrelated = "tests/boundary/filesystem/unrelated.test.ts";
+  await change(
+    directory,
+    [test],
+    "await import(`../../../src/example/Probe.js`);\n",
+  );
+  const base = await change(directory, [source, unrelated]);
+  const head = await change(directory, [source, unrelated], "changed\n");
+  expect(await runPlanScript(directory, base, head)).toMatchObject({
+    testSelection: { mode: "selected", files: [test, unrelated] },
+  });
+});
+
 it("selects the tests a pull request affects and runs everything when it cannot decide", async () => {
   const { directory } = await fixture();
   // The entrypoint's output file is not part of the change.
@@ -495,6 +515,7 @@ it("selects the tests a pull request affects and runs everything when it cannot 
   });
   const output = await readFile(join(directory, "scope-output"), "utf8");
   expect(output).toContain("test_mode=selected\n");
+  expect(output).toContain("test_shard_job=test-shard\n");
   expect(output).toContain('test_shards=["1/1"]\n');
 
   // ci:full, main pushes and shared or untraced inputs run the complete suite.
@@ -516,9 +537,12 @@ it("selects the tests a pull request affects and runs everything when it cannot 
   ]) {
     const parent = previous;
     previous = await change(directory, [path]);
-    expect(await classify(directory, parent, previous)).toMatchObject({
+    expect(await runPlanScript(directory, parent, previous)).toMatchObject({
       testSelection: { mode: "full", reason: expect.stringContaining(path) },
     });
+    expect(await readFile(join(directory, "scope-output"), "utf8")).toContain(
+      "test_shard_job=test-shard-broad\n",
+    );
   }
   // A leaf owner's boundary tests cover its other modules.
   const unreached = await change(
@@ -542,11 +566,29 @@ it("selects the tests a pull request affects and runs everything when it cannot 
     (_, index) => `tests/composition/many${String(index)}.test.ts`,
   );
   const wide = await change(directory, many);
-  expect(await classify(directory, isolated, wide)).toMatchObject({
-    testSelection: {
-      mode: "full",
-      reason: "401 affected test files exceed the 400-file selection cap",
-    },
+  const widePlan = await runPlanScript(directory, isolated, wide);
+  const activeSelection = {
+    version: 3,
+    mode: "full",
+    reason: "401 affected test files exceed the 400-file selection cap",
+  };
+  expect(widePlan.testSelection).toEqual(activeSelection);
+  const wideOutput = await readFile(join(directory, "scope-output"), "utf8");
+  expect(wideOutput).toContain("test_shadow=true\n");
+  expect(wideOutput).toContain(
+    `test_selection=${JSON.stringify(activeSelection)}\n`,
+  );
+  expect(
+    JSON.parse(
+      await readFile(
+        join(directory, ".git", "test-selection-shadow.json"),
+        "utf8",
+      ),
+    ),
+  ).toEqual({
+    version: 1,
+    sha: wide,
+    files: [...many].sort(),
   });
   const capped = await change(directory, many.slice(0, 101), "// edited\n");
   expect(await classify(directory, wide, capped)).toMatchObject({
@@ -711,14 +753,20 @@ it.each([
   },
 );
 
-const reverseToolsVitestConfig = await readFile(
-  new URL("../../../vitest.reverse-tools.config.ts", import.meta.url),
-  "utf8",
-);
-const reverseToolsVitestInputs = [
-  ...reverseToolsVitestConfig.matchAll(/"((?:\.\/)?(?:src|tests)\/[^"]+)"/gu),
-].flatMap((match) =>
-  match[1] === undefined ? [] : [match[1].replace(/^\.\//u, "")],
+const reverseToolsVitestInputs = (
+  await Promise.all(
+    [
+      "vitest.reverse-tools.config.ts",
+      "vitest.reverse-tools-semantics.config.ts",
+    ].map((name) =>
+      readFile(new URL(`../../../${name}`, import.meta.url), "utf8"),
+    ),
+  )
+).flatMap((source) =>
+  Array.from(
+    source.matchAll(/"((?:\.\/)?(?:src|tests)\/[^"]+)"/gu),
+    ([, path]) => path!.replace(/^\.\//u, ""),
+  ),
 );
 const reverseToolsMutationConfig = JSON.parse(
   await readFile(
@@ -736,8 +784,9 @@ const reverseToolsInputs = [
 ];
 
 it.each(reverseToolsInputs)(
-  "selects the reverse-tool quality gate for configured input %s",
+  "keeps configured reverse-tool input %s on disk and in the quality gate",
   async (path) => {
+    await access(new URL(`../../../${path}`, import.meta.url));
     expect(await classifyPaths([path])).toMatchObject({
       code: true,
       reverse_tools: true,
@@ -2415,4 +2464,52 @@ it("reads a Git blob whose path contains a line break alongside an ordinary blob
       ["README.md", "Initial fixture content\n"],
     ]),
   );
+});
+
+it("outputs only changed, tracked JS and TS paths for fast PR typed lint", async () => {
+  const { directory, base } = await fixture();
+  await git(directory, ["rm", "src/provider.ts"]);
+  const selected = ["scripts/ci/helper.mjs", "src/has spaces.ts"];
+  const head = await change(directory, [...selected, "docs/guide.md"]);
+  expect(await runPlanScript(directory, base, head)).toMatchObject({
+    typedLintFiles: selected,
+  });
+  expect(await readFile(join(directory, "scope-output"), "utf8")).toContain(
+    `typed_lint_files=${JSON.stringify(selected)}\n`,
+  );
+  expect(
+    await classify(directory, base, head, "pull_request", true),
+  ).toMatchObject({ typedLintFiles: [] });
+  expect(await classify(directory, base, head, "push")).toMatchObject({
+    typedLintFiles: [],
+  });
+});
+
+it("requests full typed lint when changed paths exceed the CI output budget", () => {
+  const files = Array.from(
+    { length: 200 },
+    (_, index) => `src/${"長".repeat(40)}-${index}.ts`,
+  );
+  const plan = planChanges(
+    {
+      event: "pull_request",
+      full: false,
+      skipFull: false,
+      base: PATH_BASE,
+      head: PATH_HEAD,
+    },
+    {
+      mergeBase: () => PATH_BASE,
+      isAncestor: () => true,
+      changedFiles: () => files,
+      readFile: () => "{}",
+      listFiles: () => files,
+      readFiles: () => new Map(),
+    },
+  );
+  expect(plan).toMatchObject({
+    tier: "fast",
+    code: true,
+    typedLintFiles: null,
+  });
 });

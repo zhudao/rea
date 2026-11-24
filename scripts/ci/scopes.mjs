@@ -109,7 +109,6 @@ const PATH_SCOPES = {
     "tests/boundary/providers/GdbSession*.test.ts",
     "tests/boundary/providers/GdbCommandQueue.test.ts",
     "tests/boundary/providers/gdbTestHelpers.ts",
-    "tests/boundary/providers/RizinDebugSessionCoverage.part*.test.ts",
     "tests/boundary/providers/RizinDebugSession*.test.ts",
     "tests/boundary/providers/RizinInferiorTty.test.ts",
     "tests/boundary/providers/RizinDecoderInputs.test.ts",
@@ -120,7 +119,6 @@ const PATH_SCOPES = {
     "tests/boundary/cli/reverseEngineeringCommands.test.ts",
     "tests/boundary/mcp/cutter*.test.ts",
     "tests/boundary/mcp/gdb*.test.ts",
-    "tests/boundary/mcp/debuggerCancellationMcp.test.ts",
     "tests/boundary/mcp/rizinDebuggerCancellationMcp.test.ts",
     "tests/boundary/mcp/rizinPendingOutput.test.ts",
     "tests/boundary/mcp/reverseEngineeringPartialMcp.test.ts",
@@ -738,6 +736,14 @@ const PATH_SCOPES = {
     ".github/workflows/website-pages.yml",
   ],
 };
+
+// Only the broad PR matrix waits for static checks. Shared qualification and
+// selected PR tests can start as soon as their runtime artifact is available.
+export function testShardJob(event, tier, mode) {
+  return event === "pull_request" && tier === "fast" && mode === "full"
+    ? "test-shard-broad"
+    : "test-shard";
+}
 
 // Each lane owns its path inputs, selection policy, and required jobs. The
 // workflow stays explicit; contract tests bind it to this registry.
