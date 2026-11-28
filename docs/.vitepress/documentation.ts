@@ -109,6 +109,11 @@ export const documentationSections = [
         route: "/binary-diagnostics",
       },
       {
+        text: "YARA rule matches",
+        source: "guides/native/yara-matches.md",
+        route: "/yara-matches",
+      },
+      {
         text: "ELF separate debug files",
         source: "guides/native/elf-debug-link.md",
         route: "/elf-debug-link",
@@ -122,6 +127,11 @@ export const documentationSections = [
         text: "ELF unwind function ranges",
         source: "guides/native/elf-unwind-ranges.md",
         route: "/elf-unwind-ranges",
+      },
+      {
+        text: "Mach-O function starts",
+        source: "guides/native/macho-function-starts.md",
+        route: "/macho-function-starts",
       },
       {
         text: "Linux kernel build config",
@@ -197,6 +207,11 @@ export const documentationSections = [
         text: "Rust binary dependency metadata",
         source: "rust-binaries.md",
         route: "/rust-binaries",
+      },
+      {
+        text: "LabVIEW RSRC containers",
+        source: "guides/native/labview-analysis.md",
+        route: "/labview-analysis",
       },
       {
         text: "Static CUDA and HIP code objects",
@@ -354,6 +369,11 @@ export const documentationSections = [
         route: "/android-boot-image",
       },
       {
+        text: "Android DTBO partition images",
+        source: "android-dtbo.md",
+        route: "/android-dtbo",
+      },
+      {
         text: "APK signature schemes",
         source: "apk-signature.md",
         route: "/apk-signature",
@@ -414,6 +434,11 @@ export const documentationSections = [
         route: "/firmware-analysis",
       },
       {
+        text: "Firmware interrupt and trap vector tables",
+        source: "guides/firmware/firmware-vector-tables.md",
+        route: "/firmware-vector-tables",
+      },
+      {
         text: "Android OTA update payloads",
         source: "guides/firmware/android-ota-payload.md",
         route: "/android-ota-payload",
@@ -444,6 +469,11 @@ export const documentationSections = [
         route: "/esp-flash-image",
       },
       {
+        text: "ESP-IDF NVS partitions",
+        source: "guides/firmware/esp-nvs.md",
+        route: "/esp-nvs",
+      },
+      {
         text: "ESP images",
         source: "esp-image.md",
         route: "/esp-image",
@@ -457,6 +487,11 @@ export const documentationSections = [
         text: "Qualcomm MBN images",
         source: "guides/firmware/qualcomm-mbn-images.md",
         route: "/qualcomm-mbn-images",
+      },
+      {
+        text: "Image4 containers",
+        source: "guides/apple/image4-containers.md",
+        route: "/image4-containers",
       },
       {
         text: "Intel HEX and S-record images",
@@ -569,6 +604,16 @@ export const documentationSections = [
         route: "/nds-roms",
       },
       {
+        text: "Sega Mega Drive ROMs",
+        source: "guides/firmware/mega-drive-roms.md",
+        route: "/mega-drive-roms",
+      },
+      {
+        text: "Nintendo 64 ROMs",
+        source: "guides/firmware/n64-roms.md",
+        route: "/n64-roms",
+      },
+      {
         text: "WeChat mini-program wxapkg archives",
         source: "wxapkg.md",
         route: "/wxapkg",
@@ -597,6 +642,11 @@ export const documentationSections = [
         text: "GPU asset headers: DDS, GLB, KTX and KTX2",
         source: "gpu-asset-headers.md",
         route: "/gpu-asset-headers",
+      },
+      {
+        text: "Media and cache asset headers: Ogg Opus, RIFF/XMA2, Bink 2 and Vulkan pipeline caches",
+        source: "media-asset-headers.md",
+        route: "/media-asset-headers",
       },
     ],
   },
